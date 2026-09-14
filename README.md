@@ -1,5 +1,5 @@
 # Python things
-This is a place for all things Python
+This is a place for all things LogicMonitor and Python
 
 ## Author
 Ryan Gillan  
