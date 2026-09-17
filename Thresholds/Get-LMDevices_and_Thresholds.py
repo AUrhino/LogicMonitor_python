@@ -35,6 +35,8 @@ def parse_args():
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("--groupid", required=True, help="LogicMonitor device group ID.")
+    parser.add_argument("--subGroups", type=str_to_bool, default=False, metavar="true|false",
+                        help="Include child groups recursively (default: false).")
     parser.add_argument(
         "--creds-file", metavar="PATH",
         help="Load ACCESS_ID, ACCESS_KEY, and COMPANY from a dotenv credentials file.",
@@ -42,6 +44,8 @@ def parse_args():
     parser.add_argument("--resource", metavar="DISPLAY_NAME", help="Only process this resource display name.")
     parser.add_argument("--instance", metavar="NAME", help="Only process this DataSource instance name.")
     parser.add_argument("--datapoint", metavar="NAME", help="Only export this datapoint name.")
+    parser.add_argument("--alertStatus", action="store_true",
+                        help="Include alertDisableStatus and its meaning in the CSV output.")
     parser.add_argument(
         "--output", "--csv", dest="output_path", default="output.csv",
         help="CSV output path (default: output.csv).",
@@ -85,6 +89,39 @@ def get_items(path, params=None, debug=False):
     return data if isinstance(data, list) else []
 
 
+def str_to_bool(value):
+    if value.strip().lower() in ("true", "t", "yes", "y", "1"):
+        return True
+    if value.strip().lower() in ("false", "f", "no", "n", "0"):
+        return False
+    raise argparse.ArgumentTypeError("Expected true or false.")
+
+
+def get_group(group_id, debug=False):
+    try:
+        return api_get(f"/device/groups/{group_id}", {"size": 1000, "offset": 0}, debug)
+    except requests.RequestException as error:
+        print(f"Warning: request failed for group {group_id}: {error}")
+        return {}
+
+
+def collect_groups(group_id, include_subgroups, debug=False):
+    groups = []
+
+    def visit(current_id):
+        group = get_group(current_id, debug)
+        if not group:
+            return
+        groups.append((current_id, group))
+        if include_subgroups:
+            for child in group.get("subGroups", []) or []:
+                if isinstance(child, dict) and child.get("id") is not None:
+                    visit(child["id"])
+
+    visit(group_id)
+    return groups
+
+
 def alert_items(path, debug):
     try:
         payload = api_get(path, {"size": 1000, "offset": 0}, debug)
@@ -101,7 +138,18 @@ def alert_items(path, debug):
         return []
 
 
-def threshold_rows(items, resource, module, threshold_level, datapoint_filter=None):
+def alert_status_meaning(value):
+    meanings = {
+        "none-disable-none": "Alerting is disabled directly on the device.",
+        "disable-none-none": "Alerting is disabled by a device group the device belongs to.",
+        "none-none-disable": "Alerting is disabled below the device, such as on a DataSource, instance, or datapoint.",
+        "none-none-none": "No alert-disable condition exists at the group, device, or child/sub-resource levels.",
+    }
+    return meanings.get(value, "Unknown or mixed alert-disable status.")
+
+
+def threshold_rows(items, resource, module, threshold_level, datapoint_filter=None,
+                  alert_status=None):
     rows = []
     for item in items:
         if not isinstance(item, dict):
@@ -113,13 +161,16 @@ def threshold_rows(items, resource, module, threshold_level, datapoint_filter=No
         # Only export an override. Empty expressions mean that no threshold is set.
         if expression in (None, "") or expression == default_expression:
             continue
-        rows.append([
+        row = [
             item.get("dataPointId"),
             resource,
             module,
             threshold_level,
             expression,
-        ])
+        ]
+        if alert_status is not None:
+            row.extend([alert_status, alert_status_meaning(alert_status)])
+        rows.append(row)
     return rows
 
 
@@ -143,17 +194,26 @@ def main():
     if missing:
         raise SystemExit(f"Missing required environment variable(s): {', '.join(missing)}")
 
-    try:
-        devices = get_items(
-            f"/device/groups/{args.groupid}/devices",
-            {"size": 1000, "offset": 0},
-            args.debug,
-        )
-    except requests.RequestException as error:
-        raise SystemExit(f"Unable to fetch devices for group {args.groupid}: {error}")
+    groups = collect_groups(args.groupid, args.subGroups, args.debug)
+    device_groups = []
+    for group_id, group in groups:
+        print(f"Working on Group id {group_id}")
+        print(f"Name: {group.get('name', '')}")
+        print(f"Description: {group.get('description', '')}")
+        try:
+            group_devices = get_items(
+                f"/device/groups/{group_id}/devices",
+                {"size": 1000, "offset": 0},
+                args.debug,
+            )
+        except requests.RequestException as error:
+            print(f"Warning: unable to fetch devices for group {group_id}: {error}")
+            group_devices = []
+        print(f"Device count: {len(group_devices)}")
+        device_groups.extend((device, group_id) for device in group_devices)
 
     rows = []
-    for device in devices:
+    for device, current_group_id in device_groups:
         if not isinstance(device, dict) or device.get("id") is None:
             continue
         device_id = device["id"]
@@ -197,26 +257,31 @@ def main():
                     module,
                     "resource_or_instance",
                     args.datapoint,
+                    device.get("alertDisableStatus") if args.alertStatus else None,
                 ))
             if matching_instance:
                 rows.extend(threshold_rows(
                 alert_items(
-                    f"/device/groups/{args.groupid}/datasources/{module_datasource_id}/alertsettings",
+                    f"/device/groups/{current_group_id}/datasources/{module_datasource_id}/alertsettings",
                     args.debug,
                 ),
-                args.groupid,
+                current_group_id,
                 module,
                 "group",
                 args.datapoint,
+                device.get("alertDisableStatus") if args.alertStatus else None,
                 ))
 
     output = Path(args.output_path).expanduser()
     output.parent.mkdir(parents=True, exist_ok=True)
     with output.open("w", newline="", encoding="utf-8-sig") as handle:
         writer = csv.writer(handle)
-        writer.writerow(["id", "resource", "module", "threshold set at", "Expr"])
+        headers = ["id", "resource", "module", "threshold set at", "Expr"]
+        if args.alertStatus:
+            headers.extend(["alertDisableStatus", "alertDisableStatusMeaning"])
+        writer.writerow(headers)
         writer.writerows(rows)
-    print(f"Exported {len(rows)} threshold override(s) for {len(devices)} device(s) to {output}")
+    print(f"Exported {len(rows)} threshold override(s) for {len(device_groups)} device(s) to {output}")
 
 
 if __name__ == "__main__":
