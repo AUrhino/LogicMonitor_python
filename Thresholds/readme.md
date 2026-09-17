@@ -65,11 +65,13 @@ By default, results are written to `output.csv` in the current directory.
 | Argument | Required | Description |
 |---|---:|---|
 | `--groupid ID` | Yes | LogicMonitor device group ID to inspect. |
+| `--subGroups true\|false` | No | Recursively include child groups. Defaults to `false`. |
 | `--output PATH` | No | CSV output path. Defaults to `output.csv`. |
 | `--creds-file PATH` | No | Load `ACCESS_ID`, `ACCESS_KEY`, and `COMPANY` from a dotenv file. |
 | `--resource DISPLAY_NAME` | No | Restrict processing to an exact, case-insensitive resource display name. |
 | `--instance NAME` | No | Restrict processing to an exact, case-insensitive DataSource instance name. |
 | `--datapoint NAME` | No | Export only an exact, case-insensitive datapoint name. |
+| `--alertStatus` | No | Add the raw `alertDisableStatus` and its meaning to the CSV. |
 | `--debug` | No | Print API request URLs and HTTP status codes. |
 | `--help` | No | Display command help and examples. |
 
@@ -82,6 +84,14 @@ Export all threshold overrides from group `17`:
 ```bash
 python3 Get-LMDevices_and_Thresholds.py --groupid 17
 ```
+
+Include the group and all child groups:
+
+```bash
+python3 Get-LMDevices_and_Thresholds.py --groupid 1 --subGroups true
+```
+
+As each group is processed, the script prints its ID, name, description, and direct device count.
 
 Write to a specific file:
 
@@ -109,6 +119,14 @@ python3 Get-LMDevices_and_Thresholds.py \
   --datapoint PingLossPercent
 ```
 
+Include device alert-disable status and its meaning:
+
+```bash
+python3 Get-LMDevices_and_Thresholds.py \
+  --groupid 17 \
+  --alertStatus
+```
+
 Use custom credentials and debug logging:
 
 ```bash
@@ -132,6 +150,17 @@ id,resource,module,threshold set at,Expr
 - `module`: DataSource name or display name.
 - `threshold set at`: `resource_or_instance` or `group`.
 - `Expr`: The custom `alertExpr` value.
+- `alertDisableStatus`: The three-part status in `GROUP-DEVICE-CHILD` order.
+- `alertDisableStatusMeaning`: Plain-English explanation of the status.
+
+The possible standard status values are:
+
+| Value | Meaning |
+|---|---|
+| `none-disable-none` | Alerting is disabled directly on the device. |
+| `disable-none-none` | Alerting is disabled by a device group the device belongs to. |
+| `none-none-disable` | Alerting is disabled below the device, such as on a DataSource, instance, or datapoint. |
+| `none-none-none` | No alert-disable condition exists at the group, device, or child/sub-resource levels. |
 
 For example:
 
