@@ -1,0 +1,11 @@
+[
+  {
+    "Creator": "Ryan Gillan",
+    "Email": "sample.email.com",
+    "Title": "Professor",
+    "LM_Addr": "123 Sydney St, Sydney, NSW, 2000, Australia.",
+    "__Document_Status_example_types_to_use": "DRAFT/FINAL/REVIEW",
+    "Document_Status": "DRAFT",
+    "date_format": "dd-mm-yyyy"
+  }
+]
