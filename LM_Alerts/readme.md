@@ -2,7 +2,7 @@
 
 `Get-LMAlerts.py` retrieves LogicMonitor alerts through the REST API. It can retrieve account-wide alerts, alerts for one device, or one alert by ID. Results are displayed in the terminal and JSON files are written to `output/`.
 
-Get-LMAlerts version: **1.0.7**  
+Get-LMAlerts version: **1.0.8**  
 Group exporter version: **1.0.0**
 
 ## Requirements
@@ -53,6 +53,7 @@ python3 Get-LMAlerts.py account --fields "id,severity,monitorObjectName"
 python3 Get-LMAlerts.py account --verbose
 python3 Get-LMAlerts.py account --page-size 100 --output-dir ./output
 python Get-LMAlerts.py account --creds .sample --days-ago 30 --verbose --page-size 1000 --output-dir output/sample
+python Get-LMAlerts.py account --creds .sample --days-ago 30 --filter 'cleared:true' --verbose --page-size 1000 --output-dir output/sample/cleared
 python3 Get-LMAlerts.py account --debug --verbose
 ```
 
@@ -90,14 +91,15 @@ python3 Get-LMAlerts.py alert --alert-id DS267 --debug --verbose
 - JSON responses are saved under `output/`.
 - `--save-table` also saves the report as a `.text` file.
 - Use `--output-dir PATH` to choose another output directory.
-- `--days-ago N` returns alerts from the last N days.
-- `--hours-ago N` returns alerts from the last N hours. `--alert-id ID` narrows list mode to a specific alert.
+- `--days-ago N` returns alerts from the last N days. For resolved alerts (`cleared:true`), the window uses `endEpoch` (clear time); active alerts use `startEpoch`.
+- `--hours-ago N` uses the same active-start/resolved-clear time rule. `--alert-id ID` narrows list mode to a specific alert.
 - `--creds PATH` loads LogicMonitor credentials from the specified dotenv file (default: `.env`).
 - Device mode accepts epoch timestamps with `--start` and `--end`.
 - Dates are displayed in the `Australia/Sydney` timezone.
 - Add `--debug` to print the API URL, request parameters, response status, and full error traceback when troubleshooting.
 - Add `--verbose` to display every field returned by the API. `StartEpoch` is hidden from default views but remains available in verbose output.
 - Account alert pagination recognizes LogicMonitor's negative `total` value as an unknown count and continues until the API returns a short page.
+- The account endpoint sorts by `+resourceId` for stable pagination. To collect resolved alerts, use the unquoted filter expression `cleared:true` (quote the whole expression for the shell, as shown above). The filter `cleared:"true"` is not equivalent for this endpoint.
 - For repeatable analysis instructions and a copy-ready AI prompt, see `How_to_analyse_your_alerts.md`.
 
 ## Author
