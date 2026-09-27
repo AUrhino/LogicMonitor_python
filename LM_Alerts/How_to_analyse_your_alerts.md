@@ -2,7 +2,7 @@
 
 This guide explains how to collect a 30-day alert snapshot, export group monitoring configuration, and ask an AI assistant to produce an evidence-based alert reduction review.
 
-Save this guide beside `Get-LMAlerts.py` and `readme.md` so it stays with the scripts. Save each run under a dated directory such as `output/seatrium/2026-09-27/` so new exports do not overwrite earlier analysis inputs.
+Save this guide beside `Get-LMAlerts.py` and `readme.md` so it stays with the scripts. Save each run under a dated directory such as `output/sample/2026-09-27/` so new exports do not overwrite earlier analysis inputs.
 
 ## 1. Open the script folder and activate Python
 
@@ -23,7 +23,7 @@ python Get-LMAlerts.py account \
   --days-ago 30 \
   --verbose \
   --page-size 1000 \
-  --output-dir output/seatrium/YYYY-MM-DD
+  --output-dir output/sample/YYYY-MM-DD
 ```
 
 This writes `getAlerts_accountwide_30d.json`. The JSON preserves all fields returned by the Alerts API. The script follows pagination until a short page; a negative `total` from LogicMonitor means the total is unknown and is not used as a stopping count.
@@ -37,7 +37,7 @@ python Get-LMAlerts.py account \
   --filter 'cleared:true' \
   --verbose \
   --page-size 1000 \
-  --output-dir output/seatrium/YYYY-MM-DD/cleared
+  --output-dir output/sample/YYYY-MM-DD/cleared
 ```
 
 The query may return no cleared records. If so, explain that duration and recurrence analysis is limited to active alerts; do not treat an active-alert snapshot as a history of every alert transition.
@@ -56,7 +56,7 @@ Then export that group, including subgroups by default:
 python export_group_monitoring.py \
   --creds .sample \
   --group-id 1234 \
-  --output-dir output/seatrium/YYYY-MM-DD/group-config
+  --output-dir output/sample/YYYY-MM-DD/group-config
 ```
 
 Replace `1234` with the intended group ID. You can use `--group-name "exact/full/group/path"` instead. Add `--no-subgroups` if only direct membership should be included. The export writes a complete JSON record and a flattened datapoint/threshold CSV. It captures datasource definitions and collection-interval fields, datapoints, group and instance alert settings, and group/resource properties that may contain overrides. This is a read-only export.
