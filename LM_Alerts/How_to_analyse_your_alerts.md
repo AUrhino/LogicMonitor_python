@@ -7,7 +7,7 @@ Save this guide beside `Get-LMAlerts.py` and `readme.md` so it stays with the sc
 ## 1. Open the script folder and activate Python
 
 ```bash
-cd "/Users/ryan.gillan/Documents/Python_Testing/Handy Scripts/Alerts"
+cd "Alerts"
 source ~/python/bin/activate
 ```
 
