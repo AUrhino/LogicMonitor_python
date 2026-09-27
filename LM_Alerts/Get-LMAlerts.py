@@ -49,8 +49,6 @@ except ImportError:
     tabulate = None
 
 
-load_dotenv()
-
 ACCESS_KEY = os.getenv("ACCESS_KEY", "")
 ACCESS_ID = os.getenv("ACCESS_ID", "")
 COMPANY = os.getenv("COMPANY", "")
@@ -85,6 +83,18 @@ PREVIEW_REQUIRED_FIELDS = [
     "sdted",
     "SDT",
     "cleared",
+    "ruleId",
+    "chainId",
+    "receivedList",
+    "inAlerting",
+    "suppressor",
+    "suppressDesc",
+    "alertExternalTicketUrl",
+    "dependencyRoutingState",
+    "dependencyRole",
+    "externalTicketId",
+    "dependencyMessage",
+    "dependentAlertCount",
     "acked",
     "detailMessage",
 ]
@@ -105,6 +115,18 @@ SINGLE_ALERT_REQUIRED_FIELDS = [
     "ackedBy",
     "rule",
     "chain",
+    "ruleId",
+    "chainId",
+    "receivedList",
+    "inAlerting",
+    "suppressor",
+    "suppressDesc",
+    "alertExternalTicketUrl",
+    "dependencyRoutingState",
+    "dependencyRole",
+    "externalTicketId",
+    "dependencyMessage",
+    "dependentAlertCount",
     "detailMessage",
 ]
 
@@ -128,6 +150,19 @@ def validate_env() -> None:
             "Missing required environment variables in .env: "
             + ", ".join(missing)
         )
+
+
+def load_credentials(env_file: str) -> None:
+    """Load credentials from the selected dotenv file, overriding inherited env."""
+    global ACCESS_KEY, ACCESS_ID, COMPANY, BASE_URL
+    if not os.path.isfile(env_file):
+        raise SystemExit(f"Credentials file not found: {env_file}")
+    load_dotenv(env_file, override=True)
+    ACCESS_KEY = os.getenv("ACCESS_KEY", "")
+    ACCESS_ID = os.getenv("ACCESS_ID", "")
+    COMPANY = os.getenv("COMPANY", "")
+    BASE_URL = f"https://{COMPANY}.logicmonitor.com/santaba/rest"
+    validate_env()
 
 
 def positive_int(value: str) -> int:
@@ -166,6 +201,10 @@ def normalize_epoch_to_seconds(epoch_value: Any) -> Optional[int]:
 
 def days_ago_to_epoch_seconds(days: int) -> int:
     return int(time.time()) - (days * 86400)
+
+
+def hours_ago_to_epoch_seconds(hours: int) -> int:
+    return int(time.time()) - (hours * 3600)
 
 
 def format_gmt_offset(dt: datetime) -> str:
@@ -259,6 +298,19 @@ def filter_alerts_since_days(
             filtered.append(alert)
 
     return filtered
+
+
+def filter_alerts_since_hours(alerts: List[Dict[str, Any]], hours_ago: Optional[int]) -> List[Dict[str, Any]]:
+    if hours_ago is None:
+        return alerts
+    cutoff_seconds = int(time.time()) - hours_ago * 3600
+    return [a for a in alerts if (normalize_epoch_to_seconds(a.get("startEpoch")) or 0) >= cutoff_seconds]
+
+
+def filter_alerts_by_id(alerts: List[Dict[str, Any]], alert_id: Optional[str]) -> List[Dict[str, Any]]:
+    if not alert_id:
+        return alerts
+    return [a for a in alerts if str(a.get("id", "")) == alert_id]
 
 
 def alert_sdt_value(alert: Dict[str, Any]) -> str:
@@ -568,17 +620,18 @@ def paged_get_items(
         if not isinstance(items, list):
             break
 
-        all_items.extend([item for item in items if isinstance(item, dict)])
+        # The alerts endpoint can return a negative `total` when it cannot
+        # calculate an exact count (for example, -201 for a 200-row page).
+        # Treat that as unknown and continue until a short page arrives.
+        page_items = [item for item in items if isinstance(item, dict)]
+        all_items.extend(page_items)
 
         total = data.get("total")
-        if isinstance(total, int):
-            offset += page_size
-            if offset >= total:
-                break
-        else:
-            if len(items) < page_size:
-                break
-            offset += page_size
+        offset += len(items)
+        if len(items) < page_size:
+            break
+        if isinstance(total, int) and total > 0 and offset >= total:
+            break
 
     return all_items, last_resp
 
@@ -606,6 +659,18 @@ def format_alert_rows(
                 alert_sdt_value(alert),
                 alert.get("cleared"),
                 alert.get("acked"),
+                alert.get("ruleId"),
+                alert.get("chainId"),
+                alert.get("receivedList"),
+                alert.get("inAlerting"),
+                alert.get("suppressor"),
+                alert.get("suppressDesc"),
+                alert.get("alertExternalTicketUrl"),
+                alert.get("dependencyRoutingState"),
+                alert.get("dependencyRole"),
+                alert.get("externalTicketId"),
+                alert.get("dependencyMessage"),
+                alert.get("dependentAlertCount"),
                 message_value_for_table(
                     alert.get("detailMessage"),
                     include_full_body=include_full_message_in_table,
@@ -655,6 +720,18 @@ def build_alert_preview_report(
         "SDT",
         "Cleared",
         "Acked",
+        "Rule ID",
+        "Chain ID",
+        "Received List",
+        "In Alerting",
+        "Suppressor",
+        "Suppress Description",
+        "External Ticket URL",
+        "Dependency Routing State",
+        "Dependency Role",
+        "External Ticket ID",
+        "Dependency Message",
+        "Dependent Alert Count",
         "Message",
     ]
 
@@ -711,6 +788,18 @@ def build_single_alert_report(
         ["Acked By", alert.get("ackedBy")],
         ["Rule", alert.get("rule")],
         ["Chain", alert.get("chain")],
+        ["Rule ID", alert.get("ruleId")],
+        ["Chain ID", alert.get("chainId")],
+        ["Received List", alert.get("receivedList")],
+        ["In Alerting", alert.get("inAlerting")],
+        ["Suppressor", alert.get("suppressor")],
+        ["Suppress Description", alert.get("suppressDesc")],
+        ["External Ticket URL", alert.get("alertExternalTicketUrl")],
+        ["Dependency Routing State", alert.get("dependencyRoutingState")],
+        ["Dependency Role", alert.get("dependencyRole")],
+        ["External Ticket ID", alert.get("externalTicketId")],
+        ["Dependency Message", alert.get("dependencyMessage")],
+        ["Dependent Alert Count", alert.get("dependentAlertCount")],
         [
             "Message",
             message_value_for_table(
@@ -741,8 +830,7 @@ def get_alerts_accountwide(
     params: Dict[str, Any] = {}
     if lm_filter:
         params["filter"] = lm_filter
-    if fields:
-        params["fields"] = ensure_required_fields(fields, PREVIEW_REQUIRED_FIELDS)
+    params["fields"] = ensure_required_fields(fields, PREVIEW_REQUIRED_FIELDS)
 
     alerts, _ = paged_get_items("/alert/alerts", base_params=params, page_size=page_size)
     return alerts
@@ -769,8 +857,7 @@ def get_alerts_for_device(
 
     if lm_filter:
         params["filter"] = lm_filter
-    if fields:
-        params["fields"] = ensure_required_fields(fields, PREVIEW_REQUIRED_FIELDS)
+    params["fields"] = ensure_required_fields(fields, PREVIEW_REQUIRED_FIELDS)
     if custom_columns:
         params["customColumns"] = custom_columns
     if start is not None:
@@ -798,8 +885,7 @@ def get_alert_by_id(
     params: Dict[str, Any] = {
         "needMessage": str(need_message).lower(),
     }
-    if fields:
-        params["fields"] = ensure_required_fields(fields, SINGLE_ALERT_REQUIRED_FIELDS)
+    params["fields"] = ensure_required_fields(fields, SINGLE_ALERT_REQUIRED_FIELDS)
     if custom_columns:
         params["customColumns"] = custom_columns
 
@@ -826,6 +912,9 @@ def build_parser() -> argparse.ArgumentParser:
     python Get-LMAlerts.py account --fields "id,severity,monitorObjectName"
     python Get-LMAlerts.py account --days-ago 1
     python Get-LMAlerts.py account --days-ago 7 --filter "cleared:false"
+    python Get-LMAlerts.py account --hours-ago 6
+    python Get-LMAlerts.py account --alert-id DS267
+    python Get-LMAlerts.py account --hours-ago 24 --alert-id DS267 --creds ./production.env
     python Get-LMAlerts.py account --save-table
     python Get-LMAlerts.py account --page-size 100 --output-dir ./output
     python Get-LMAlerts.py account --debug --verbose
@@ -836,6 +925,7 @@ def build_parser() -> argparse.ArgumentParser:
     python Get-LMAlerts.py device --device-id 123 --need-message
     python Get-LMAlerts.py device --device-id 123 --filter "severity:>=3"
     python Get-LMAlerts.py device --device-id 123 --days-ago 7
+    python Get-LMAlerts.py device --device-id 123 --hours-ago 12 --alert-id DS267
     python Get-LMAlerts.py device --device-id 123 --days-ago 14 --need-message --save-table
     python Get-LMAlerts.py device --device-id 123 --start 1773581054 --end 1773667454
     python Get-LMAlerts.py device --device-id 123 --fields "id,severity,monitorObjectName"
@@ -851,8 +941,15 @@ def build_parser() -> argparse.ArgumentParser:
     python Get-LMAlerts.py alert --alert-id DS267 --custom-columns "property=value" --output-dir ./output
     python Get-LMAlerts.py alert --alert-id DS267 --debug --verbose
 
+  Alternate credentials:
+    python Get-LMAlerts.py --creds ./production.env account --hours-ago 24
+    python Get-LMAlerts.py account --creds ./production.env --alert-id DS267
+
 Notes:
   --days-ago means "alerts since N days ago"
+  --hours-ago means "alerts since N hours ago" (account and device modes)
+  --alert-id filters account/device results to one alert; alert mode fetches one alert directly
+  --creds PATH loads ACCESS_ID, ACCESS_KEY, and COMPANY from PATH (default: .env)
   For device mode, explicit --start takes precedence over --days-ago
   Date is shown in Australia/Sydney
   Duration is computed from startEpoch/endEpoch, or startEpoch-to-now for active alerts
@@ -860,6 +957,10 @@ Notes:
   --save-table writes the displayed ASCII report to a .text file in the output directory
   --debug prints API URL, parameters, response status, and error details to stderr
   --verbose shows every field returned by the API
+  Default alert output includes ruleId, chainId, receivedList, suppressor, suppressDesc,
+  alertExternalTicketUrl, cleared, dependencyRoutingState, and dependencyRole
+  externalTicketId (for ##EXTERNALTICKETID.<integrationName>##), dependencyMessage
+  (##DEPENDENCYMESSAGE##), and dependentAlertCount (##DEPENDENTALERTCOUNT##)
   When --save-table is used, the saved table includes the full message body when available
   Saved table output does not append a separate Detail Message section
   JSON output is still saved under ./output by default
@@ -876,6 +977,7 @@ Notes:
         action="version",
         version=f"%(prog)s {__version__}",
     )
+    parser.add_argument("--creds", dest="creds", default=".env", help="Credentials .env file (default: .env)")
     subparsers = parser.add_subparsers(dest="command")
 
     account_examples = """Examples:
@@ -906,6 +1008,9 @@ Notes:
         type=positive_int,
         help="Only show alerts from the last N days (examples: 1, 7, 14)",
     )
+    account_parser.add_argument("--hours-ago", type=positive_int, help="Only show alerts from the last N hours")
+    account_parser.add_argument("--alert-id", help="Only show the alert with this ID")
+    account_parser.add_argument("--creds", dest="creds", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
     account_parser.add_argument(
         "--page-size",
         type=int,
@@ -988,6 +1093,9 @@ Notes:
         type=positive_int,
         help="Only show alerts from the last N days (examples: 1, 7, 14)",
     )
+    device_parser.add_argument("--hours-ago", type=positive_int, help="Only show alerts from the last N hours")
+    device_parser.add_argument("--alert-id", help="Only show the alert with this ID")
+    device_parser.add_argument("--creds", dest="creds", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
     device_parser.add_argument(
         "--page-size",
         type=int,
@@ -1029,6 +1137,7 @@ Notes:
         required=True,
         help="Alert ID",
     )
+    alert_parser.add_argument("--creds", dest="creds", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
     alert_parser.add_argument(
         "--need-message",
         action="store_true",
@@ -1071,7 +1180,7 @@ def main() -> int:
         parser.print_help()
         return 0
 
-    validate_env()
+    load_credentials(args.creds)
     DEBUG = args.debug
 
     try:
@@ -1082,7 +1191,8 @@ def main() -> int:
                 page_size=args.page_size,
             )
 
-            alerts = filter_alerts_since_days(alerts, args.days_ago)
+            alerts = filter_alerts_since_hours(filter_alerts_since_days(alerts, args.days_ago), args.hours_ago)
+            alerts = filter_alerts_by_id(alerts, args.alert_id)
 
             if alerts:
                 title = (
@@ -1128,6 +1238,8 @@ def main() -> int:
             effective_start = args.start
             if effective_start is None and args.days_ago is not None:
                 effective_start = days_ago_to_epoch_seconds(args.days_ago)
+            if effective_start is None and args.hours_ago is not None:
+                effective_start = hours_ago_to_epoch_seconds(args.hours_ago)
 
             alerts = get_alerts_for_device(
                 device_id=args.device_id,
@@ -1141,7 +1253,8 @@ def main() -> int:
                 end=args.end,
             )
 
-            alerts = filter_alerts_since_days(alerts, args.days_ago)
+            alerts = filter_alerts_since_hours(filter_alerts_since_days(alerts, args.days_ago), args.hours_ago)
+            alerts = filter_alerts_by_id(alerts, args.alert_id)
 
             if alerts:
                 title = (
