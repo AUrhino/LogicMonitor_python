@@ -16,6 +16,8 @@ from typing import Any, Dict, Iterable, List, Optional
 
 from LMToolkit import LMClient
 
+__version__ = "1.0.0"
+
 
 def payload_data(payload: Any) -> Any:
     return payload.get("data", payload) if isinstance(payload, dict) else payload
@@ -278,6 +280,7 @@ def write_outputs(data: dict, out_dir: Path) -> tuple:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     parser.add_argument("--creds", default=".env", help="Credentials dotenv file (default: .env)")
     parser.add_argument("--group-id", help="LogicMonitor device group ID")
     parser.add_argument("--group-name", help="Exact group name or full path")
