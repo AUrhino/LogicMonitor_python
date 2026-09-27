@@ -36,7 +36,7 @@ import requests
 from dotenv import load_dotenv
 
 
-__version__ = "1.0.6"
+__version__ = "1.0.7"
 
 try:
     from zoneinfo import ZoneInfo
