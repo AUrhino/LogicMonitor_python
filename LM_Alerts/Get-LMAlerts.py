@@ -36,7 +36,7 @@ import requests
 from dotenv import load_dotenv
 
 
-__version__ = "1.0.7"
+__version__ = "1.0.8"
 
 try:
     from zoneinfo import ZoneInfo
@@ -281,6 +281,24 @@ def alert_duration_value(alert: Dict[str, Any]) -> str:
     return seconds_to_duration_string(duration_seconds)
 
 
+def alert_window_epoch(alert: Dict[str, Any]) -> Optional[int]:
+    """Use clear time for resolved alerts and start time for active alerts."""
+    cleared = str(alert.get("cleared", "")).strip().lower() in {"true", "1", "yes"}
+    if cleared:
+        end_seconds = normalize_epoch_to_seconds(alert.get("endEpoch"))
+        if end_seconds:
+            return end_seconds
+    return normalize_epoch_to_seconds(alert.get("startEpoch"))
+
+
+def filter_requests_cleared(lm_filter: Optional[str]) -> bool:
+    """Detect the API filter for resolved alerts so device queries are not
+    prematurely constrained by their original start time."""
+    if not lm_filter:
+        return False
+    return bool(re.search(r"(?:^|,)\s*cleared\s*:\s*(?:true|1)(?:\s*,|$)", lm_filter, re.IGNORECASE))
+
+
 def filter_alerts_since_days(
     alerts: List[Dict[str, Any]], days_ago: Optional[int]
 ) -> List[Dict[str, Any]]:
@@ -291,10 +309,10 @@ def filter_alerts_since_days(
     filtered: List[Dict[str, Any]] = []
 
     for alert in alerts:
-        alert_start_seconds = normalize_epoch_to_seconds(alert.get("startEpoch"))
-        if alert_start_seconds is None:
+        window_epoch = alert_window_epoch(alert)
+        if window_epoch is None:
             continue
-        if alert_start_seconds >= cutoff_seconds:
+        if window_epoch >= cutoff_seconds:
             filtered.append(alert)
 
     return filtered
@@ -304,7 +322,7 @@ def filter_alerts_since_hours(alerts: List[Dict[str, Any]], hours_ago: Optional[
     if hours_ago is None:
         return alerts
     cutoff_seconds = int(time.time()) - hours_ago * 3600
-    return [a for a in alerts if (normalize_epoch_to_seconds(a.get("startEpoch")) or 0) >= cutoff_seconds]
+    return [a for a in alerts if (alert_window_epoch(a) or 0) >= cutoff_seconds]
 
 
 def filter_alerts_by_id(alerts: List[Dict[str, Any]], alert_id: Optional[str]) -> List[Dict[str, Any]]:
@@ -830,6 +848,9 @@ def get_alerts_accountwide(
     params: Dict[str, Any] = {}
     if lm_filter:
         params["filter"] = lm_filter
+    # Stable ordering is important because the Alerts endpoint can return an
+    # unknown negative total and require multiple size/offset requests.
+    params["sort"] = "+resourceId"
     params["fields"] = ensure_required_fields(fields, PREVIEW_REQUIRED_FIELDS)
 
     alerts, _ = paged_get_items("/alert/alerts", base_params=params, page_size=page_size)
@@ -909,6 +930,7 @@ def build_parser() -> argparse.ArgumentParser:
   Account-wide alerts:
     python Get-LMAlerts.py account
     python Get-LMAlerts.py account --filter "cleared:false"
+    python Get-LMAlerts.py account --filter 'cleared:true' --days-ago 30 --page-size 1000
     python Get-LMAlerts.py account --fields "id,severity,monitorObjectName"
     python Get-LMAlerts.py account --days-ago 1
     python Get-LMAlerts.py account --days-ago 7 --filter "cleared:false"
@@ -953,6 +975,7 @@ Notes:
   For device mode, explicit --start takes precedence over --days-ago
   Date is shown in Australia/Sydney
   Duration is computed from startEpoch/endEpoch, or startEpoch-to-now for active alerts
+  --days-ago and --hours-ago use endEpoch for cleared alerts and startEpoch for active alerts
   Message is populated when detailMessage is returned by the API
   --save-table writes the displayed ASCII report to a .text file in the output directory
   --debug prints API URL, parameters, response status, and error details to stderr
@@ -997,7 +1020,7 @@ Notes:
     account_parser.add_argument(
         "--filter",
         dest="lm_filter",
-        help="Optional LogicMonitor filter string",
+        help="Optional LogicMonitor filter string (use cleared:true to fetch resolved alerts)",
     )
     account_parser.add_argument(
         "--fields",
@@ -1236,9 +1259,10 @@ def main() -> int:
 
         if args.command == "device":
             effective_start = args.start
-            if effective_start is None and args.days_ago is not None:
+            closed_query = filter_requests_cleared(args.lm_filter)
+            if effective_start is None and not closed_query and args.days_ago is not None:
                 effective_start = days_ago_to_epoch_seconds(args.days_ago)
-            if effective_start is None and args.hours_ago is not None:
+            if effective_start is None and not closed_query and args.hours_ago is not None:
                 effective_start = hours_ago_to_epoch_seconds(args.hours_ago)
 
             alerts = get_alerts_for_device(
