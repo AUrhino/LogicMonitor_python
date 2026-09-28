@@ -7,7 +7,7 @@ Save this guide beside `Get-LMAlerts.py` and `readme.md` so it stays with the sc
 ## 1. Open the script folder and activate Python
 
 ```bash
-cd "/Users/ryan.gillan/Documents/Python_Testing/Handy Scripts/Alerts"
+cd "Alerts"
 source ~/python/bin/activate
 ```
 
@@ -26,7 +26,36 @@ python Get-LMAlerts.py account \
   --output-dir output/sample/YYYY-MM-DD
 ```
 
-This writes `getAlerts_accountwide_30d.json`. The JSON preserves all fields returned by the Alerts API. The script follows pagination until a short page; a negative `total` from LogicMonitor means the total is unknown and is not used as a stopping count.
+This writes `getAlerts_accountwide_30d.json`. The JSON preserves all fields returned by the Alerts API. The script prints a status before each page request and reports the running record count. It follows pagination until a short page; a negative `total` from LogicMonitor means the total is unknown and is not used as a stopping count.
+
+To print a day-by-hour count table for the same period, including active and cleared alerts, run:
+
+```bash
+python Get-LMAlerts.py account \
+  --creds .sample \
+  --days-ago 30 \
+  --counts \
+  --save-table \
+  --page-size 1000 \
+  --output-dir output/sample/YYYY-MM-DD
+```
+
+The table uses each alert's `startEpoch` and `Australia/Sydney` local time. Columns `00` through `23` are the hours of day; column `24` is the row's daily total. It is automatically saved as `getAlerts_accountwide_counts_30d.csv`; matching raw alert records are saved as JSON. You can use `--hours-ago N` instead of `--days-ago N`. Counts mode requests `cleared:*` so LogicMonitor returns active and cleared alerts; any narrower `cleared:` predicate passed through `--filter` is replaced. Add `--save-table` if you also want the ASCII table saved as `.text`.
+
+To inspect the alert records behind one hourly cell—for example, 11:00 on 23 September 2026—run:
+
+```bash
+python Get-LMAlerts.py account \
+  --creds .sample \
+  --counts-verbose \
+  --date 23-09-2026 \
+  --hour 11 \
+  --save-table \
+  --page-size 1000 \
+  --output-dir output/sample/YYYY-MM-DD
+```
+
+This prints only alerts whose start time falls from 11:00 through 11:59 on 23-09-2026 in `Australia/Sydney`, including active and cleared records. It shows all matched alerts, not just the first 50, and automatically saves the matching records to date/hour-specific CSV and JSON files. `--save-table` also saves the detail table as `.text`.
 
 If you also need resolved alerts, run a separate cleared-alert query:
 
@@ -40,7 +69,7 @@ python Get-LMAlerts.py account \
   --output-dir output/sample/YYYY-MM-DD/cleared
 ```
 
-The account endpoint sorts by `+resourceId`, paginates until a short page, and applies the 30-day window to `endEpoch` for cleared alerts. The shell quotes the full filter expression; keep `true` unquoted inside the filter (`cleared:true`). A filter such as `cleared:"true"` is not equivalent. The JSON contains only closed alerts whose clear time falls in the selected window. If it is empty, state that limitation; do not treat an active-alert snapshot as a history of every alert transition.
+The account endpoint sorts by `+resourceId`, paginates until a short page, and applies the 30-day window to `endEpoch` for cleared alerts. Quote the whole filter for the shell and keep `true` unquoted inside it (`'cleared:true'`). If you copied the UI request filter `rule:"*",type:"*",cleared:"true"`, the script removes the redundant wildcard clauses and normalizes the boolean before sending the API request. Sending that UI-style filter directly to the endpoint returns no rows. The JSON contains only closed alerts whose clear time falls in the selected window. If it is empty, state that limitation; do not treat an active-alert snapshot as a history of every alert transition.
 
 ## 3. Export a group's monitoring configuration (recommended)
 
@@ -60,6 +89,16 @@ python export_group_monitoring.py \
 ```
 
 Replace `1234` with the intended group ID. You can use `--group-name "exact/full/group/path"` instead. Add `--no-subgroups` if only direct membership should be included. The export writes a complete JSON record and a flattened datapoint/threshold CSV. It captures datasource definitions and collection-interval fields, datapoints, group and instance alert settings, and group/resource properties that may contain overrides. This is a read-only export.
+
+To list all alert rules and identify devices that match no rule's device/group scope, run:
+
+```bash
+python audit_alert_rule_coverage.py \
+  --creds .sample \
+  --output-dir output/sample/YYYY-MM-DD/alert-rule-audit
+```
+
+This writes `alert_rules.csv`, `escalation_chains.csv/.json`, `integrations.csv/.json`, `device_groups.csv`, `device_rule_coverage.csv`, `devices_without_alert_rule.csv`, `alert_rule_coverage.json`, and refreshes `alert_rule_coverage_report.md` on every run. The Markdown report includes a Mermaid flow diagram from a resource alert through its matching rule, escalation chain, destination, and stages. Integration exports contain metadata only; they omit credentials, endpoints, headers, and payload templates. The coverage comparison evaluates device-name and group selectors; it does not evaluate datasource, instance, datapoint, resource-property, or attribute selectors. Review the exported rule criteria before treating a device as fully covered. LogicMonitor's rule defaults can use `*` for all devices and groups, so a broad rule can mean the uncovered list is empty.
 
 ## 4. Review the inputs before asking AI
 
