@@ -56,8 +56,8 @@ python3 Get-LMAlerts.py account --filter "cleared:false" --save-table
 python3 Get-LMAlerts.py account --fields "id,severity,monitorObjectName"
 python3 Get-LMAlerts.py account --verbose
 python3 Get-LMAlerts.py account --page-size 100 --output-dir ./output
-python Get-LMAlerts.py account --creds .sample --days-ago 30 --verbose --page-size 1000 --output-dir output/seatrium
-python Get-LMAlerts.py account --creds .sample --days-ago 30 --filter 'cleared:true' --verbose --page-size 1000 --output-dir output/seatrium/cleared
+python Get-LMAlerts.py account --creds .sample --days-ago 30 --verbose --page-size 1000 --output-dir output/sample
+python Get-LMAlerts.py account --creds .sample --days-ago 30 --filter 'cleared:true' --verbose --page-size 1000 --output-dir output/sample/cleared
 python3 Get-LMAlerts.py account --debug --verbose
 ```
 
@@ -122,8 +122,8 @@ Email: ryangillan@gmail.com
 ```bash
 source ~/python/bin/activate
 python export_group_monitoring.py --creds .sample --list-groups
-python export_group_monitoring.py --creds .sample --group-id 1234 --output-dir output/seatrium/group-config
-python audit_alert_rule_coverage.py --creds .sample --output-dir output/seatrium/alert-rule-audit
+python export_group_monitoring.py --creds .sample --group-id 1234 --output-dir output/sample/group-config
+python audit_alert_rule_coverage.py --creds .sample --output-dir output/sample/alert-rule-audit
 ```
 
 Use `--group-name "full/group/path"` instead of `--group-id` when the path is unique. Add `--no-subgroups` to limit the export to resources directly assigned to that group. The JSON retains full API records; the CSV flattens datapoints and their group/instance alert settings. Read-only LogicMonitor API access is required.
