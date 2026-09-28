@@ -21,6 +21,7 @@ Requirements:
 
 import argparse
 import base64
+import csv
 import hashlib
 import hmac
 import json
@@ -36,7 +37,7 @@ import requests
 from dotenv import load_dotenv
 
 
-__version__ = "1.0.8"
+__version__ = "1.2.3"
 
 try:
     from zoneinfo import ZoneInfo
@@ -172,6 +173,23 @@ def positive_int(value: str) -> int:
     return ivalue
 
 
+def parse_local_date(value: str):
+    try:
+        return datetime.strptime(value, "%d-%m-%Y").date()
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("Date must use DD-MM-YYYY format") from exc
+
+
+def hour_of_day(value: str) -> int:
+    try:
+        hour = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("Hour must be an integer from 00 to 23") from exc
+    if not 0 <= hour <= 23:
+        raise argparse.ArgumentTypeError("Hour must be from 00 to 23")
+    return hour
+
+
 def normalize_epoch_to_seconds(epoch_value: Any) -> Optional[int]:
     """
     Normalize epoch values that may be provided in:
@@ -296,7 +314,51 @@ def filter_requests_cleared(lm_filter: Optional[str]) -> bool:
     prematurely constrained by their original start time."""
     if not lm_filter:
         return False
-    return bool(re.search(r"(?:^|,)\s*cleared\s*:\s*(?:true|1)(?:\s*,|$)", lm_filter, re.IGNORECASE))
+    return bool(
+        re.search(
+            r'(?:^|,)\s*cleared\s*:\s*["\']?(?:true|1)["\']?(?:\s*,|$)',
+            lm_filter,
+            re.IGNORECASE,
+        )
+    )
+
+
+def normalize_account_alert_filter(lm_filter: Optional[str]) -> Optional[str]:
+    """Remove redundant wildcard clauses and normalize boolean filter values.
+
+    LogicMonitor's UI-style filter
+    ``rule:"*",type:"*",cleared:"true"`` returns no rows from the account
+    alerts API, while the equivalent meaningful predicate ``cleared:true``
+    returns resolved alerts. Wildcard rule/type clauses do not narrow the
+    requested result, so omit them for this endpoint.
+    """
+    if not lm_filter:
+        return lm_filter
+
+    clauses = [clause.strip() for clause in lm_filter.split(",") if clause.strip()]
+    normalized: List[str] = []
+    for clause in clauses:
+        if re.fullmatch(r'(?:rule|type)\s*:\s*["\']\*["\']', clause, re.IGNORECASE):
+            continue
+        clause = re.sub(
+            r'^(cleared\s*:\s*)["\'](true|false|1|0)["\']$',
+            r"\1\2",
+            clause,
+            flags=re.IGNORECASE,
+        )
+        normalized.append(clause)
+    return ",".join(normalized) or None
+
+
+def normalize_counts_filter(lm_filter: Optional[str]) -> Optional[str]:
+    """Request active and cleared alerts, retaining other filter predicates."""
+    clauses = [clause.strip() for clause in (lm_filter or "").split(",") if clause.strip()]
+    remaining = [
+        clause for clause in clauses
+        if not re.match(r"^cleared\s*:", clause, re.IGNORECASE)
+    ]
+    remaining.append("cleared:*")
+    return normalize_account_alert_filter(",".join(remaining))
 
 
 def filter_alerts_since_days(
@@ -323,6 +385,91 @@ def filter_alerts_since_hours(alerts: List[Dict[str, Any]], hours_ago: Optional[
         return alerts
     cutoff_seconds = int(time.time()) - hours_ago * 3600
     return [a for a in alerts if (alert_window_epoch(a) or 0) >= cutoff_seconds]
+
+
+def filter_alerts_by_start_time(
+    alerts: List[Dict[str, Any]], days_ago: Optional[int], hours_ago: Optional[int]
+) -> List[Dict[str, Any]]:
+    """Filter all alert states by their start time for volume/count reports."""
+    cutoffs = []
+    if days_ago is not None:
+        cutoffs.append(days_ago_to_epoch_seconds(days_ago))
+    if hours_ago is not None:
+        cutoffs.append(hours_ago_to_epoch_seconds(hours_ago))
+    if not cutoffs:
+        return alerts
+    cutoff = max(cutoffs)
+    return [
+        alert for alert in alerts
+        if (normalize_epoch_to_seconds(alert.get("startEpoch")) or 0) >= cutoff
+    ]
+
+
+def filter_alerts_by_local_hour(
+    alerts: List[Dict[str, Any]], selected_date, selected_hour: int
+) -> List[Dict[str, Any]]:
+    """Select alerts whose start time falls within a local date/hour bucket."""
+    matches = []
+    for alert in alerts:
+        epoch = normalize_epoch_to_seconds(alert.get("startEpoch"))
+        if epoch is None:
+            continue
+        local_time = datetime.fromtimestamp(epoch, tz=DISPLAY_TIMEZONE)
+        if local_time.date() == selected_date and local_time.hour == selected_hour:
+            matches.append(alert)
+    return matches
+
+
+def build_hourly_alert_counts_report(
+    alerts: List[Dict[str, Any]], days_ago: Optional[int], hours_ago: Optional[int]
+) -> str:
+    """Render daily alert-start counts by Australia/Sydney hour."""
+    headers, rows = build_hourly_alert_counts_data(alerts, days_ago, hours_ago)
+    period = f"last {days_ago} day(s)" if days_ago is not None else (
+        f"last {hours_ago} hour(s)" if hours_ago is not None else "all returned alerts"
+    )
+    title = (
+        f"Alert starts by hour in Australia/Sydney ({period}; "
+        f"includes active and cleared alerts; 24 = daily total)"
+    )
+    return render_table(rows, headers, title)
+
+
+def build_hourly_alert_counts_data(
+    alerts: List[Dict[str, Any]], days_ago: Optional[int], hours_ago: Optional[int]
+) -> Tuple[List[str], List[List[Any]]]:
+    """Return the CSV/table structure for hourly alert counts."""
+    counts: Dict[Any, List[int]] = {}
+    for alert in alerts:
+        epoch = normalize_epoch_to_seconds(alert.get("startEpoch"))
+        if epoch is None:
+            continue
+        dt = datetime.fromtimestamp(epoch, tz=DISPLAY_TIMEZONE)
+        day_counts = counts.setdefault(dt.date(), [0] * 25)
+        day_counts[dt.hour] += 1
+        day_counts[24] += 1
+
+    if days_ago is not None or hours_ago is not None:
+        now_local = datetime.now(DISPLAY_TIMEZONE)
+        cutoffs = []
+        if days_ago is not None:
+            cutoffs.append(days_ago_to_epoch_seconds(days_ago))
+        if hours_ago is not None:
+            cutoffs.append(hours_ago_to_epoch_seconds(hours_ago))
+        cutoff_epoch = max(cutoffs)
+        first_day = datetime.fromtimestamp(cutoff_epoch, tz=DISPLAY_TIMEZONE).date()
+        last_day = now_local.date()
+        current_day = first_day
+        while current_day <= last_day:
+            counts.setdefault(current_day, [0] * 25)
+            current_day += timedelta(days=1)
+
+    headers = ["Date"] + [f"{hour:02d}" for hour in range(24)] + ["24"]
+    rows = [
+        [day.strftime("%d-%m-%Y")] + values
+        for day, values in sorted(counts.items())
+    ]
+    return headers, rows
 
 
 def filter_alerts_by_id(alerts: List[Dict[str, Any]], alert_id: Optional[str]) -> List[Dict[str, Any]]:
@@ -534,6 +681,34 @@ def save_text(out_dir: str, filename: str, content: str) -> None:
     print(f"Saved: {path}")
 
 
+def save_csv(out_dir: str, filename: str, headers: List[str], rows: List[List[Any]]) -> None:
+    ensure_out_dir(out_dir)
+    path = os.path.join(out_dir, filename)
+    with open(path, "w", encoding="utf-8-sig", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(headers)
+        writer.writerows(rows)
+    print(f"Saved: {path}")
+
+
+def save_alerts_csv(out_dir: str, filename: str, alerts: List[Dict[str, Any]]) -> None:
+    """Save alert records as CSV, serializing structured fields as JSON strings."""
+    headers = list(dict.fromkeys([
+        *PREVIEW_REQUIRED_FIELDS,
+        *(key for alert in alerts for key in alert),
+    ]))
+    rows = []
+    for alert in alerts:
+        row = []
+        for key in headers:
+            value = alert.get(key, "")
+            if isinstance(value, (dict, list)):
+                value = json.dumps(value, ensure_ascii=False)
+            row.append(value)
+        rows.append(row)
+    save_csv(out_dir, filename, headers, rows)
+
+
 def render_ascii_grid(rows: List[List[Any]], headers: List[str]) -> str:
     prepared_headers = ["" if h is None else str(h) for h in headers]
     prepared_rows = [
@@ -613,6 +788,7 @@ def paged_get_items(
     resource_path: str,
     base_params: Optional[Dict[str, Any]] = None,
     page_size: int = DEFAULT_PAGE_SIZE,
+    show_progress: bool = False,
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     """
     Fetch all items from a paginated LM endpoint that uses size/offset.
@@ -621,8 +797,16 @@ def paged_get_items(
     all_items: List[Dict[str, Any]] = []
     offset = 0
     last_resp: Dict[str, Any] = {}
+    page_number = 0
 
     while True:
+        page_number += 1
+        if show_progress:
+            print(
+                f"Fetching alert page {page_number} from LogicMonitor "
+                f"({len(all_items):,} alerts fetched so far)...",
+                flush=True,
+            )
         params = dict(base_params or {})
         params["size"] = page_size
         params["offset"] = offset
@@ -651,6 +835,11 @@ def paged_get_items(
         if isinstance(total, int) and total > 0 and offset >= total:
             break
 
+    if show_progress:
+        print(
+            f"Fetched {len(all_items):,} alert records across {page_number:,} page(s).",
+            flush=True,
+        )
     return all_items, last_resp
 
 
@@ -703,11 +892,13 @@ def build_alert_preview_report(
     title: str,
     include_full_message_in_table: bool = False,
     verbose: bool = False,
+    limit: Optional[int] = None,
 ) -> str:
+    preview_limit = DEFAULT_PREVIEW_LIMIT if limit is None else max(0, limit)
     if verbose:
         field_names = list(dict.fromkeys(
             field_name
-            for alert in alerts[:DEFAULT_PREVIEW_LIMIT]
+            for alert in alerts[:preview_limit]
             for field_name in alert
         ))
         rows = [
@@ -717,11 +908,11 @@ def build_alert_preview_report(
                 else alert.get(field_name, "")
                 for field_name in field_names
             ]
-            for alert in alerts[:DEFAULT_PREVIEW_LIMIT]
+            for alert in alerts[:preview_limit]
         ]
         report_text = render_table(rows, field_names, title)
-        if len(alerts) > DEFAULT_PREVIEW_LIMIT:
-            report_text += f"\n\nShowing first {DEFAULT_PREVIEW_LIMIT} of {len(alerts)} alerts."
+        if len(alerts) > preview_limit:
+            report_text += f"\n\nShowing first {preview_limit} of {len(alerts)} alerts."
         return report_text
 
     headers = [
@@ -846,14 +1037,17 @@ def get_alerts_accountwide(
     Capture alerts account-wide.
     """
     params: Dict[str, Any] = {}
-    if lm_filter:
-        params["filter"] = lm_filter
+    normalized_filter = normalize_account_alert_filter(lm_filter)
+    if normalized_filter:
+        params["filter"] = normalized_filter
     # Stable ordering is important because the Alerts endpoint can return an
     # unknown negative total and require multiple size/offset requests.
     params["sort"] = "+resourceId"
     params["fields"] = ensure_required_fields(fields, PREVIEW_REQUIRED_FIELDS)
 
-    alerts, _ = paged_get_items("/alert/alerts", base_params=params, page_size=page_size)
+    alerts, _ = paged_get_items(
+        "/alert/alerts", base_params=params, page_size=page_size, show_progress=True
+    )
     return alerts
 
 
@@ -1007,6 +1201,8 @@ Notes:
   python Get-LMAlerts.py account
   python Get-LMAlerts.py account --filter "cleared:false"
   python Get-LMAlerts.py account --days-ago 7
+  python Get-LMAlerts.py account --days-ago 30 --counts
+  python Get-LMAlerts.py account --counts-verbose --date 23-09-2026 --hour 11
   python Get-LMAlerts.py account --save-table
 """
 
@@ -1032,6 +1228,18 @@ Notes:
         help="Only show alerts from the last N days (examples: 1, 7, 14)",
     )
     account_parser.add_argument("--hours-ago", type=positive_int, help="Only show alerts from the last N hours")
+    account_parser.add_argument(
+        "--counts",
+        action="store_true",
+        help="Show daily counts by alert start hour (includes active and cleared; requires --days-ago or --hours-ago)",
+    )
+    account_parser.add_argument(
+        "--counts-verbose",
+        action="store_true",
+        help="Show all alerts starting in one local date/hour bucket; requires --date DD-MM-YYYY and --hour 00-23",
+    )
+    account_parser.add_argument("--date", type=parse_local_date, help="Local date for --counts-verbose (DD-MM-YYYY)")
+    account_parser.add_argument("--hour", type=hour_of_day, help="Local hour for --counts-verbose (00-23)")
     account_parser.add_argument("--alert-id", help="Only show the alert with this ID")
     account_parser.add_argument("--creds", dest="creds", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
     account_parser.add_argument(
@@ -1203,21 +1411,62 @@ def main() -> int:
         parser.print_help()
         return 0
 
+    if args.command == "account":
+        if args.counts and args.days_ago is None and args.hours_ago is None:
+            parser.error("--counts requires --days-ago or --hours-ago to define the period")
+        if args.counts and args.counts_verbose:
+            parser.error("--counts and --counts-verbose are separate report modes")
+        if args.counts_verbose and (args.date is None or args.hour is None):
+            parser.error("--counts-verbose requires both --date DD-MM-YYYY and --hour 00-23")
+        if not args.counts_verbose and (args.date is not None or args.hour is not None):
+            parser.error("--date and --hour are only used with --counts-verbose")
+        if args.counts_verbose and (args.days_ago is not None or args.hours_ago is not None):
+            parser.error("Use --date and --hour for --counts-verbose instead of --days-ago/--hours-ago")
+
     load_credentials(args.creds)
     DEBUG = args.debug
 
     try:
         if args.command == "account":
+            counts_mode = args.counts or args.counts_verbose
+            query_filter = normalize_counts_filter(args.lm_filter) if counts_mode else args.lm_filter
             alerts = get_alerts_accountwide(
-                lm_filter=args.lm_filter,
+                lm_filter=query_filter,
                 fields=args.fields,
                 page_size=args.page_size,
             )
 
-            alerts = filter_alerts_since_hours(filter_alerts_since_days(alerts, args.days_ago), args.hours_ago)
+            if args.counts:
+                alerts = filter_alerts_by_start_time(alerts, args.days_ago, args.hours_ago)
+            elif args.counts_verbose:
+                alerts = filter_alerts_by_local_hour(alerts, args.date, args.hour)
+            else:
+                alerts = filter_alerts_since_hours(filter_alerts_since_days(alerts, args.days_ago), args.hours_ago)
             alerts = filter_alerts_by_id(alerts, args.alert_id)
 
-            if alerts:
+            if args.counts:
+                console_report = build_hourly_alert_counts_report(
+                    alerts, args.days_ago, args.hours_ago
+                )
+                file_report = console_report
+            elif args.counts_verbose:
+                if alerts:
+                    title = (
+                        f"Alerts starting {args.date.strftime('%d-%m-%Y')} "
+                        f"during {args.hour:02d}:00–{args.hour:02d}:59 "
+                        f"Australia/Sydney ({len(alerts)} alerts; active and cleared)"
+                    )
+                    console_report = build_alert_preview_report(
+                        alerts, title, verbose=True, limit=len(alerts)
+                    )
+                    file_report = console_report
+                else:
+                    console_report = (
+                        f"No alerts started on {args.date.strftime('%d-%m-%Y')} "
+                        f"during hour {args.hour:02d} Australia/Sydney."
+                    )
+                    file_report = console_report
+            elif alerts:
                 title = (
                     f"Account Alerts (showing first {DEFAULT_PREVIEW_LIMIT} of "
                     f"{len(alerts)})"
@@ -1249,12 +1498,41 @@ def main() -> int:
                 text_filename = "getAlerts_accountwide.text"
                 if args.days_ago:
                     text_filename = f"getAlerts_accountwide_{args.days_ago}d.text"
+                elif args.hours_ago:
+                    text_filename = f"getAlerts_accountwide_{args.hours_ago}h.text"
+                if args.counts:
+                    period_suffix = f"{args.days_ago}d" if args.days_ago is not None else f"{args.hours_ago}h"
+                    text_filename = f"getAlerts_accountwide_counts_{period_suffix}.text"
+                elif args.counts_verbose:
+                    text_filename = f"getAlerts_accountwide_counts_verbose_{args.date.strftime('%d-%m-%Y')}_{args.hour:02d}.text"
                 save_text(args.output_dir, text_filename, file_report)
 
             json_filename = "getAlerts_accountwide.json"
-            if args.days_ago:
+            if args.counts:
+                period_suffix = f"{args.days_ago}d" if args.days_ago is not None else f"{args.hours_ago}h"
+                json_filename = f"getAlerts_accountwide_counts_{period_suffix}.json"
+            elif args.counts_verbose:
+                json_filename = f"getAlerts_accountwide_counts_verbose_{args.date.strftime('%d-%m-%Y')}_{args.hour:02d}.json"
+            elif args.days_ago:
                 json_filename = f"getAlerts_accountwide_{args.days_ago}d.json"
             save_json(args.output_dir, json_filename, alerts)
+            if args.counts:
+                csv_headers, csv_rows = build_hourly_alert_counts_data(
+                    alerts, args.days_ago, args.hours_ago
+                )
+                period_suffix = f"{args.days_ago}d" if args.days_ago is not None else f"{args.hours_ago}h"
+                save_csv(
+                    args.output_dir,
+                    f"getAlerts_accountwide_counts_{period_suffix}.csv",
+                    csv_headers,
+                    csv_rows,
+                )
+            elif args.counts_verbose:
+                save_alerts_csv(
+                    args.output_dir,
+                    f"getAlerts_accountwide_counts_verbose_{args.date.strftime('%d-%m-%Y')}_{args.hour:02d}.csv",
+                    alerts,
+                )
             return 0
 
         if args.command == "device":
