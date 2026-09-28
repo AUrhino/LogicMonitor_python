@@ -2,8 +2,9 @@
 
 `Get-LMAlerts.py` retrieves LogicMonitor alerts through the REST API. It can retrieve account-wide alerts, alerts for one device, or one alert by ID. Results are displayed in the terminal and JSON files are written to `output/`.
 
-Get-LMAlerts version: **1.0.8**  
+Get-LMAlerts version: **1.2.3**  
 Group exporter version: **1.0.0**
+Alert rule audit version: **1.2.0**
 
 ## Requirements
 
@@ -46,14 +47,17 @@ Account-wide alerts:
 ```bash
 python3 Get-LMAlerts.py account
 python3 Get-LMAlerts.py account --days-ago 7
+python3 Get-LMAlerts.py account --days-ago 30 --counts --save-table
+python3 Get-LMAlerts.py account --hours-ago 48 --counts
+python3 Get-LMAlerts.py account --counts-verbose --date 23-09-2026 --hour 11 --save-table
 python3 Get-LMAlerts.py account --hours-ago 6 --creds ./production.env
 python3 Get-LMAlerts.py account --alert-id DS267
 python3 Get-LMAlerts.py account --filter "cleared:false" --save-table
 python3 Get-LMAlerts.py account --fields "id,severity,monitorObjectName"
 python3 Get-LMAlerts.py account --verbose
 python3 Get-LMAlerts.py account --page-size 100 --output-dir ./output
-python Get-LMAlerts.py account --creds .sample --days-ago 30 --verbose --page-size 1000 --output-dir output/sample
-python Get-LMAlerts.py account --creds .sample --days-ago 30 --filter 'cleared:true' --verbose --page-size 1000 --output-dir output/sample/cleared
+python Get-LMAlerts.py account --creds .sample --days-ago 30 --verbose --page-size 1000 --output-dir output/seatrium
+python Get-LMAlerts.py account --creds .sample --days-ago 30 --filter 'cleared:true' --verbose --page-size 1000 --output-dir output/seatrium/cleared
 python3 Get-LMAlerts.py account --debug --verbose
 ```
 
@@ -93,13 +97,17 @@ python3 Get-LMAlerts.py alert --alert-id DS267 --debug --verbose
 - Use `--output-dir PATH` to choose another output directory.
 - `--days-ago N` returns alerts from the last N days. For resolved alerts (`cleared:true`), the window uses `endEpoch` (clear time); active alerts use `startEpoch`.
 - `--hours-ago N` uses the same active-start/resolved-clear time rule. `--alert-id ID` narrows list mode to a specific alert.
+- `--counts` with `--days-ago N` or `--hours-ago N` prints daily counts by alert start hour in `Australia/Sydney`. It includes active and cleared alerts, ignores any `cleared:` condition supplied in `--filter`, and uses columns `00`–`23` for hours and `24` for the daily total. It automatically saves the table as CSV and the matching alert records as JSON; `--save-table` also saves a `.text` copy.
+- `--counts-verbose --date DD-MM-YYYY --hour HH` prints all alerts whose `startEpoch` falls within that local date and hour (00–23). This drills into one hourly count bucket and includes active and cleared alerts. It automatically saves matching alert records as CSV and JSON; `--save-table` also saves a `.text` copy.
+- Counts queries explicitly request `cleared:*`, because LogicMonitor otherwise returns active alerts only.
 - `--creds PATH` loads LogicMonitor credentials from the specified dotenv file (default: `.env`).
 - Device mode accepts epoch timestamps with `--start` and `--end`.
 - Dates are displayed in the `Australia/Sydney` timezone.
 - Add `--debug` to print the API URL, request parameters, response status, and full error traceback when troubleshooting.
 - Add `--verbose` to display every field returned by the API. `StartEpoch` is hidden from default views but remains available in verbose output.
 - Account alert pagination recognizes LogicMonitor's negative `total` value as an unknown count and continues until the API returns a short page.
-- The account endpoint sorts by `+resourceId` for stable pagination. To collect resolved alerts, use the unquoted filter expression `cleared:true` (quote the whole expression for the shell, as shown above). The filter `cleared:"true"` is not equivalent for this endpoint.
+- Account-wide queries print progress before each API page request and report the number of records fetched, so a slow query shows that it is still running.
+- The account endpoint sorts by `+resourceId` for stable pagination. To collect resolved alerts, use the filter expression `cleared:true` (quote the whole expression for the shell, as shown above). The script also normalizes the UI-style filter `rule:"*",type:"*",cleared:"true"` by removing the redundant wildcard clauses and unquoting the boolean; that raw filter returns no alerts from the API.
 - For repeatable analysis instructions and a copy-ready AI prompt, see `How_to_analyse_your_alerts.md`.
 
 ## Author
@@ -114,9 +122,12 @@ Email: ryangillan@gmail.com
 ```bash
 source ~/python/bin/activate
 python export_group_monitoring.py --creds .sample --list-groups
-python export_group_monitoring.py --creds .sample --group-id 1234 --output-dir output/sample/group-config
+python export_group_monitoring.py --creds .sample --group-id 1234 --output-dir output/seatrium/group-config
+python audit_alert_rule_coverage.py --creds .sample --output-dir output/seatrium/alert-rule-audit
 ```
 
 Use `--group-name "full/group/path"` instead of `--group-id` when the path is unique. Add `--no-subgroups` to limit the export to resources directly assigned to that group. The JSON retains full API records; the CSV flattens datapoints and their group/instance alert settings. Read-only LogicMonitor API access is required.
+
+`audit_alert_rule_coverage.py` exports alert rules, escalation chains/stages, recipient groups, integration metadata, device groups, each device's matching device/group rule scopes, and a list of devices with no matching scope. Each run refreshes CSV/JSON exports and `alert_rule_coverage_report.md`, including a Mermaid alert-to-rule-to-chain-to-stage flow diagram. Escalation stages resolve recipient-group references by ID/name where the API exposes them. `recipient_groups.json` includes complete API records and may contain member contact details; `integrations.json` preserves all fields returned by `/setting/integrations` and may contain credentials, endpoints, headers, or payload templates. Protect both JSON files and review before sharing. This is a scope audit: datasource, instance, datapoint, resource-property, and attribute filters are preserved in rule exports but are not evaluated per device, so a scope match does not guarantee every alert from that device routes through the rule.
 
 Account alert pagination treats negative `total` values from the Alerts endpoint as an unknown count and continues fetching until a short page is returned.
