@@ -37,7 +37,7 @@ python Create_Portal_AsBuilt.py
 Run from any directory:
 
 ```bash
-python "/Users/ryan.gillan/Documents/Python_Testing/Handy Scripts/As_Built/Create_Portal_AsBuilt.py" \
+python "Create_Portal_AsBuilt.py" \
   --creds-file .env \
   --output ./customer-as-built
 ```
