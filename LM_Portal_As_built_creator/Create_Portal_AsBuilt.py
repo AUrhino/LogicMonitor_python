@@ -18,6 +18,7 @@ import hmac
 import json
 import os
 import re
+import shutil
 import sys
 import time
 from datetime import datetime, timezone
@@ -32,7 +33,7 @@ from dotenv import load_dotenv
 DEFAULT_TIMEOUT = 60
 PAGE_SIZE = 1000
 API_VERSION = "3"
-__version__ = "1.04"
+__version__ = "1.07"
 SECRET_WORDS = re.compile(r"(pass(word)?|secret|token|community|private.?key|api.?key|access.?key|bearer|auth)", re.I)
 
 
@@ -76,7 +77,58 @@ def cli() -> argparse.Namespace:
         default="creator.json",
         help="Document creator JSON file; defaults to creator.json",
     )
-    parser.add_argument("--no-raw-json", action="store_true", help="Do not write raw JSON response files")
+    parser.add_argument(
+        "--company-image",
+        default="company.png",
+        help="Logo image placed at the top left of the report; defaults to company.png",
+    )
+    parser.add_argument(
+        "--no-raw-json", "--no-json", action="store_true",
+        help="Do not write raw JSON response files",
+    )
+    parser.add_argument(
+        "--no-modules", action="store_true",
+        help="Skip all LogicModule-related sections",
+    )
+    parser.add_argument(
+        "--no-reports", action="store_true",
+        help="Skip reports and report groups",
+    )
+    parser.add_argument(
+        "--no-dashboards", "--no-dashbourds", action="store_true",
+        help="Skip dashboards and dashboard groups",
+    )
+    parser.add_argument("--no-users", action="store_true", help="Skip users")
+    parser.add_argument(
+        "--no-devices", action="store_true",
+        help="Skip devices and derived Services/DataSources",
+    )
+    parser.add_argument(
+        "--no-collectors", action="store_true",
+        help="Skip collectors, collector groups, versions, and upgrade history",
+    )
+    grouped_options = {"reports", "dashboards", "users", "devices", "collectors"}
+    for section_name, _endpoint, _paginate in COLLECTIONS:
+        if section_name in grouped_options:
+            continue
+        parser.add_argument(
+            f"--no-{section_name.replace('_', '-')}",
+            action="append_const",
+            const=section_name,
+            dest="excluded_sections",
+            help=f"Skip the {section_name.replace('_', ' ')} section",
+        )
+    for section_name in (
+        "services", "datasources", "group_alert_settings",
+        "alert_routing_flow", "folder_structure", "number_of_instances_per_ds",
+    ):
+        parser.add_argument(
+            f"--no-{section_name.replace('_', '-')}",
+            action="append_const",
+            const=section_name,
+            dest="excluded_sections",
+            help=f"Skip the {section_name.replace('_', ' ')} section",
+        )
     parser.add_argument(
         "--summary",
         action="store_true",
@@ -86,7 +138,27 @@ def cli() -> argparse.Namespace:
     if len(sys.argv) == 1:
         parser.print_help()
         raise SystemExit(0)
-    return parser.parse_args()
+    args = parser.parse_args()
+    excluded = set(args.excluded_sections or [])
+    if args.no_modules:
+        excluded.update(MODULE_DATASETS)
+    if args.no_reports:
+        excluded.update({"reports", "report_groups"})
+    if args.no_dashboards:
+        excluded.update({"dashboards", "dashboard_groups"})
+    if args.no_users:
+        excluded.add("users")
+    if args.no_devices:
+        excluded.update({"devices", "services", "datasources"})
+    if args.no_collectors:
+        excluded.update(
+            {
+                "collectors", "collector_groups", "collector_versions",
+                "collector_upgrade_history",
+            }
+        )
+    args.excluded_sections = excluded
+    return args
 
 
 def safe_name(value: str) -> str:
@@ -691,6 +763,167 @@ def write_folder_structure(
     path.write_text("\n".join(lines), encoding="utf-8")
 
 
+def group_record_id(group: dict[str, Any]) -> Any:
+    return group.get("id", group.get("value"))
+
+
+def group_record_path(group: dict[str, Any]) -> str:
+    return str(
+        group.get("fullPath")
+        or group.get("name")
+        or group_record_id(group)
+        or "Unknown group"
+    )
+
+
+def collect_group_alert_settings(
+    client: LogicMonitor,
+    groups: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Collect group DataSource membership and group-level alert overrides."""
+    rows: list[dict[str, Any]] = []
+    for group in groups:
+        group_id = group_record_id(group)
+        if group_id is None:
+            continue
+        group_sources = client.collection(
+            f"group_datasources_{group_id}",
+            f"/device/groups/{group_id}/datasources",
+        )
+        for source in group_sources:
+            datasource_id = source.get("dataSourceId", source.get("datasourceId", source.get("id")))
+            datasource_name = source.get("dataSourceName", source.get("name", ""))
+            settings: list[dict[str, Any]] = []
+            if datasource_id is not None:
+                settings = client.collection(
+                    f"group_alertsettings_{group_id}_{datasource_id}",
+                    f"/device/groups/{group_id}/datasources/{datasource_id}/alertsettings",
+                    paginate=False,
+                )
+            if not settings:
+                settings = [{}]
+            for setting in settings:
+                rows.append(
+                    {
+                        "groupId": group_id,
+                        "groupPath": group_record_path(group),
+                        "dataSourceId": datasource_id,
+                        "dataSourceName": datasource_name,
+                        "dataPointId": setting.get("dataPointId", setting.get("id")),
+                        "dataPointName": setting.get("dataPointName", setting.get("name", "")),
+                        "alertExpr": setting.get("alertExpr", source.get("alertExpr")),
+                        "disableAlerting": setting.get(
+                            "disableAlerting", source.get("disableAlerting")
+                        ),
+                    }
+                )
+    return rows
+
+
+def markdown_table(
+    rows: list[dict[str, Any]], fields: tuple[str, ...]
+) -> list[str]:
+    lines = [
+        "| " + " | ".join(fields) + " |",
+        "| " + " | ".join("---" for _ in fields) + " |",
+    ]
+    for row in rows:
+        lines.append(
+            "| "
+            + " | ".join(markdown_cell(row.get(field, ""), 300) for field in fields)
+            + " |"
+        )
+    return lines + [""]
+
+
+def write_alert_routing_flow(
+    path: Path,
+    company: str,
+    datasets: dict[str, list[dict[str, Any]]],
+) -> None:
+    """Create a compact evidence-backed view of alert routing configuration."""
+    group_settings = datasets.get("group_alert_settings", [])
+    alert_rules = datasets.get("alert_rules", [])
+    escalation_chains = datasets.get("escalation_chains", [])
+    action_rules = datasets.get("action_rules", [])
+    action_chains = datasets.get("action_chains", [])
+    lines = [
+        f"# {company} LogicMonitor Alert Routing Flow",
+        "",
+        "This document combines group-level monitoring overrides with portal alert rules, escalation chains, action rules, action chains, and configured destinations.",
+        "",
+        "## Routing model",
+        "",
+        "```text",
+        "Device Group / Resource",
+        "    └── DataSource and datapoint alert settings",
+        "        └── Alert Rule match and priority",
+        "            └── Escalation Chain",
+        "                ├── Destinations / CC destinations",
+        "                └── Action Rules / Action Chains",
+        "```",
+        "",
+        "## Group monitoring and alert overrides",
+        "",
+        f"**Rows:** {len(group_settings)}  ",
+        "**Evidence:** `../csv/group_alert_settings.csv`"
+        + (
+            " and `../json/group_alert_settings.json`"
+            if (path.parent.parent / "json" / "group_alert_settings.json").is_file()
+            else ""
+        ),
+        "",
+    ]
+    if group_settings:
+        lines += markdown_table(
+            group_settings,
+            (
+                "groupId", "groupPath", "dataSourceId", "dataSourceName",
+                "dataPointId", "dataPointName", "alertExpr", "disableAlerting",
+            ),
+        )
+    else:
+        lines += ["No group alert settings were returned.", ""]
+
+    lines += ["## Alert rules", ""]
+    if alert_rules:
+        lines += markdown_table(
+            alert_rules,
+            (
+                "id", "name", "priority", "levelStr", "deviceGroups",
+                "dataSource", "instance", "dataPoint", "escalatingChainId",
+                "escalationInterval",
+            ),
+        )
+    else:
+        lines += ["No alert rules were returned.", ""]
+
+    lines += ["## Escalation chains and destinations", ""]
+    if escalation_chains:
+        lines += markdown_table(
+            escalation_chains,
+            (
+                "id", "name", "description", "enableThrottling",
+                "throttlingPeriod", "destinations", "ccDestinations",
+            ),
+        )
+    else:
+        lines += ["No escalation chains were returned.", ""]
+
+    lines += ["## Action rules", ""]
+    if action_rules:
+        lines += markdown_table(action_rules, ("id", "name", "enabled"))
+    else:
+        lines += ["No action rules were returned.", ""]
+
+    lines += ["## Action chains", ""]
+    if action_chains:
+        lines += markdown_table(action_chains, ("id", "name", "description", "stages"))
+    else:
+        lines += ["No action chains were returned.", ""]
+    path.write_text("\n".join(lines), encoding="utf-8")
+
+
 def write_summary_markdown(
     path: Path,
     company: str,
@@ -698,9 +931,16 @@ def write_summary_markdown(
     rows: list[dict[str, Any]],
     failures: list[dict[str, str]],
     creator: dict[str, Any],
+    company_image: str | None,
 ) -> None:
     display = company.replace("_", " ").replace("-", " ").title()
-    lines = [
+    lines = []
+    if company_image:
+        lines += [
+            f'<img src="{company_image}" alt="LogicMonitor" width="420">',
+            "",
+        ]
+    lines += [
         f"# {display} — LogicMonitor Company Settings",
         "",
         f"**Portal:** `{company}.logicmonitor.com`  ",
@@ -748,9 +988,16 @@ def write_markdown(
     datasets: dict[str, list[dict[str, Any]]],
     creator: dict[str, Any],
     output: Path,
+    company_image: str | None,
 ) -> None:
     display = company.replace("_", " ").replace("-", " ").title()
-    lines = [
+    lines = []
+    if company_image:
+        lines += [
+            f'<img src="{company_image}" alt="LogicMonitor" width="420">',
+            "",
+        ]
+    lines += [
         f"# {display} — LogicMonitor As-Built",
         "",
         f"**Portal:** `{company}.logicmonitor.com`  ",
@@ -781,38 +1028,47 @@ def write_markdown(
         "",
         f"- Portal URL: `https://{company}.logicmonitor.com`",
         "- Time zone, naming conventions, group purpose, global settings, and implementation decisions: complete during handover.",
-        "- Raw portal settings and API responses are in `json/company_settings.json` and the related CSV file.",
-        "",
-        "### Company settings",
-        "",
     ]
-    company_rows = datasets.get("company_settings", [])
-    if company_rows:
-        settings = company_settings_table(company_rows[0])
-        lines += ["| Setting | Value |", "|---|---|"]
-        for key in sorted(settings):
-            lines.append(f"| `{key}` | {markdown_cell(settings[key])} |")
-        instance_count_total = len(flatten(company_rows[0])) - len(settings)
-        if instance_count_total:
-            lines += [
-                "",
-                f"{instance_count_total} `numberOfInstancesPerDS.*` setting(s) were moved to separate files under `markdown/numberOfInstancesPerDS/`.",
-            ]
-    else:
-        lines.append("Company settings were not returned; see collection failures or skipped features.")
-    lines += ["", "### Alert statistics and versions", ""]
-    alert_rows = datasets.get("alert_statistics", [])
-    if alert_rows:
-        stats = flatten(alert_rows[0])
-        lines += ["| Field | Value |", "|---|---|"]
-        for key in sorted(stats):
-            lines.append(f"| `{key}` | {markdown_cell(stats[key])} |")
-    else:
-        lines.append("Alert statistics were not returned; see collection failures or skipped features.")
+    if "company_settings" in datasets:
+        lines += [
+            "- Raw portal settings and API responses are in `json/company_settings.json` and the related CSV file.",
+            "",
+            "### Company settings",
+            "",
+        ]
+        company_rows = datasets.get("company_settings", [])
+        if company_rows:
+            settings = company_settings_table(company_rows[0])
+            lines += ["| Setting | Value |", "|---|---|"]
+            for key in sorted(settings):
+                lines.append(f"| `{key}` | {markdown_cell(settings[key])} |")
+            instance_count_total = len(flatten(company_rows[0])) - len(settings)
+            if instance_count_total:
+                lines += [
+                    "",
+                    f"{instance_count_total} `numberOfInstancesPerDS.*` setting(s) were moved to separate files under `markdown/numberOfInstancesPerDS/`.",
+                ]
+        else:
+            lines.append("Company settings were not returned; see collection failures or skipped features.")
+    if "alert_statistics" in datasets:
+        lines += ["", "### Alert statistics and versions", ""]
+        alert_rows = datasets.get("alert_statistics", [])
+        if alert_rows:
+            stats = flatten(alert_rows[0])
+            lines += ["| Field | Value |", "|---|---|"]
+            for key in sorted(stats):
+                lines.append(f"| `{key}` | {markdown_cell(stats[key])} |")
+        else:
+            lines.append("Alert statistics were not returned; see collection failures or skipped features.")
     lines += ["", "## Exported evidence", "", "| Dataset | Rows | Evidence |", "|---|---:|---|"]
     for name, count in counts.items():
-        evidence = f"`csv/{name}.csv` and `json/{name}.json`"
-        if name == "device_groups":
+        evidence_parts = []
+        if (output / "csv" / f"{name}.csv").is_file():
+            evidence_parts.append(f"`csv/{name}.csv`")
+        if (output / "json" / f"{name}.json").is_file():
+            evidence_parts.append(f"`json/{name}.json`")
+        evidence = " and ".join(evidence_parts) or "—"
+        if name == "device_groups" and (output / "markdown" / "folder_structure.md").is_file():
             evidence += " and `markdown/folder_structure.md`"
         lines.append(f"| {name.replace('_', ' ').title()} | {count} | {evidence} |")
     markdown_files = sorted((output / "markdown").glob("*.md"))
@@ -827,10 +1083,16 @@ def write_markdown(
         )
     lines += ["", "## Collected API datasets", ""]
     for name, rows in datasets.items():
-        if name == "datasources":
+        if name in {"datasources", "group_alert_settings"}:
             continue
         title = name.replace("_", " ").title()
-        lines += [f"### {title}", "", f"**Rows:** {len(rows)}  ", f"**Evidence:** `csv/{name}.csv` and `json/{name}.json`", ""]
+        dataset_evidence = [f"`csv/{name}.csv`"]
+        if (output / "json" / f"{name}.json").is_file():
+            dataset_evidence.append(f"`json/{name}.json`")
+        lines += [
+            f"### {title}", "", f"**Rows:** {len(rows)}  ",
+            f"**Evidence:** {' and '.join(dataset_evidence)}", "",
+        ]
         if name in {"company_settings", "alert_statistics"}:
             lines += ["A complete formatted table appears above.", ""]
             continue
@@ -848,24 +1110,35 @@ def write_markdown(
         lines += dataset_table(name, rows, creator)
         if name == "devices":
             lines += portal_monitoring_section(company, rows)
+    if (output / "markdown" / "alert_routing_flow.md").is_file():
+        lines += [
+            "",
+            "## Alert routing flow",
+            "",
+            "Group-level DataSource alert overrides, alert rules, escalation chains, destinations, action rules, and action chains are mapped in `markdown/alert_routing_flow.md`.",
+            "",
+        ]
+    if any(name in datasets for name in ("collectors", "collector_groups", "collector_versions")):
+        lines += [
+            "## Collector design and deployment", "",
+            "Review the collector evidence for IDs, versions, groups, status, platform, and assignment fields. Record network zones, proxy/firewall requirements, upgrade policy, failover strategy, and local configuration changes during handover.", "",
+        ]
+    if any(name in datasets for name in ("devices", "device_groups", "datasources", "netscans", "websites")):
+        lines += [
+            "## Resource inventory, protocols, and credentials", "",
+            "Review the collected resource evidence. Property names are retained where returned, but secret-like values are redacted. Record protocol, inherited credential property names, least-privilege requirements, ports, and validation method without adding secrets.", "",
+        ]
+    if any(name in datasets for name in (set(MODULE_DATASETS) | {"alert_rules", "escalation_chains", "sdts"})):
+        lines += [
+            "## LogicModules and alerting", "",
+            "Review monitoring and alert evidence for deployed modules, versions, AppliesTo expressions, thresholds, discovery, disabled modules, alert priority, routing, escalation intervals, SDT, dependencies, and historical-data considerations.", "",
+        ]
+    if any(name in datasets for name in ("integrations", "dashboards", "reports", "users", "roles", "logpipelines")):
+        lines += [
+            "## Integrations, cloud, Kubernetes, logs, dashboards, and RBAC", "",
+            "The API export records objects exposed by the selected endpoints. Add implementation-specific cloud permissions, Kubernetes/LM Logs configuration, dashboard/report schedules, topology maps, SSO/2FA, API-only users, and access-group decisions that are not represented in the returned objects.", "",
+        ]
     lines += [
-        "",
-        "## Collector design and deployment",
-        "",
-        "Review `collectors.csv` and `collector_groups.csv` for IDs, versions, groups, status, platform, and assignment fields. Record network zones, proxy/firewall requirements, upgrade policy, failover strategy, and local configuration changes during handover.",
-        "",
-        "## Resource inventory, protocols, and credentials",
-        "",
-        "Review `devices.csv`, `device_groups.csv`, `datasources.csv`, `netscans.csv`, and `websites.csv`. Property names are retained where returned, but secret-like values are redacted. Record protocol, inherited credential property names, least-privilege requirements, ports, and validation method without adding secrets.",
-        "",
-        "## LogicModules and alerting",
-        "",
-        "Review DataSources and alert datasets for deployed modules, versions, AppliesTo expressions, thresholds, discovery, disabled modules, alert priority, routing, escalation intervals, SDT, dependencies, and historical-data considerations.",
-        "",
-        "## Integrations, cloud, Kubernetes, logs, dashboards, and RBAC",
-        "",
-        "The API export records objects exposed by the selected endpoints. Add implementation-specific cloud permissions, Kubernetes/LM Logs configuration, dashboard/report schedules, topology maps, SSO/2FA, API-only users, and access-group decisions that are not represented in the returned objects.",
-        "",
         "## Validation and operational handover",
         "",
         "| Area | Validation performed | Result | Evidence / notes |",
@@ -915,6 +1188,7 @@ def write_markdown(
         "├── csv",
         "├── json",
         "├── markdown",
+        "│   ├── alert_routing_flow.md",
         "│   ├── folder_structure.md",
         "│   └── numberOfInstancesPerDS",
         f"└── {path.name}",
@@ -955,6 +1229,19 @@ def main() -> int:
 
     root = Path(args.output).expanduser().resolve()
     root.mkdir(parents=True, exist_ok=True)
+    company_image_source = Path(args.company_image).expanduser()
+    if not company_image_source.is_file() and args.company_image == "company.png":
+        company_image_source = Path(__file__).with_name("company.png")
+    company_image_name: str | None = None
+    if company_image_source.is_file():
+        company_image_target = root / "company.png"
+        if company_image_source.resolve() != company_image_target.resolve():
+            shutil.copy2(company_image_source, company_image_target)
+        company_image_name = company_image_target.name
+        if args.debug:
+            print(f"[DEBUG] Company image: {company_image_source.resolve()}")
+    elif args.debug:
+        print(f"[DEBUG] Company image not found: {Path(args.company_image).expanduser()}")
     markdown_dir = prepare_markdown_folder(root)
     client = LogicMonitor(company, access_id, access_key, args.timeout, args.debug)
     counts: dict[str, int] = {}
@@ -969,7 +1256,13 @@ def main() -> int:
         write_instance_count_files(markdown_dir, rows)
         markdown_path = root / f"{safe_name(company)}_As_Built.md"
         write_summary_markdown(
-            markdown_path, company, started, rows, client.failures, creator
+            markdown_path,
+            company,
+            started,
+            rows,
+            client.failures,
+            creator,
+            company_image_name,
         )
         print(f"\nCreated company-settings summary: {markdown_path}")
         return 0 if rows else 1
@@ -978,8 +1271,17 @@ def main() -> int:
     csv_dir.mkdir(exist_ok=True)
     json_dir.mkdir(exist_ok=True)
     clean_excluded_outputs(csv_dir, json_dir)
+    if args.no_raw_json:
+        for generated_json in json_dir.glob("*.json"):
+            generated_json.unlink(missing_ok=True)
+    for excluded_name in args.excluded_sections:
+        (csv_dir / f"{excluded_name}.csv").unlink(missing_ok=True)
+        (json_dir / f"{excluded_name}.json").unlink(missing_ok=True)
 
     for name, endpoint, paginate in COLLECTIONS:
+        if name in args.excluded_sections:
+            print(f"Skipping {name}...")
+            continue
         print(f"Collecting {name}...")
         collection_params = {"sort": "+id"} if name in {"dashboards", "oids"} else None
         rows = client.collection(
@@ -993,39 +1295,66 @@ def main() -> int:
         # DataSources are a device sub-resource in REST API v3. They cannot be
         # collected from a guessed global /device/devices/devicedatasources URL.
         if name == "devices":
-            print("Collecting services...")
-            service_rows = client.collection(
-                "services",
-                "/device/devices",
-                params={"filter": 'deviceType:"6"', "sort": "+id"},
-            )
-            datasets["services"] = service_rows
-            counts["services"] = write_csv(csv_dir / "services.csv", service_rows)
-            if not args.no_raw_json:
-                write_json(json_dir / "services.json", service_rows)
-
-            datasource_rows: list[dict[str, Any]] = []
-            for device in rows:
-                device_id = device.get("id")
-                if device_id is None:
-                    continue
-                datasource_rows.extend(
-                    {
-                        "deviceId": device_id,
-                        **datasource,
-                    }
-                    for datasource in client.collection(
-                        f"datasources_{device_id}",
-                        f"/device/devices/{device_id}/devicedatasources",
-                    )
+            if "services" not in args.excluded_sections:
+                print("Collecting services...")
+                service_rows = client.collection(
+                    "services",
+                    "/device/devices",
+                    params={"filter": 'deviceType:"6"', "sort": "+id"},
                 )
-            counts["datasources"] = write_csv(csv_dir / "datasources.csv", datasource_rows)
-            datasets["datasources"] = datasource_rows
-            if not args.no_raw_json:
-                write_json(json_dir / "datasources.json", datasource_rows)
+                datasets["services"] = service_rows
+                counts["services"] = write_csv(csv_dir / "services.csv", service_rows)
+                if not args.no_raw_json:
+                    write_json(json_dir / "services.json", service_rows)
 
-    write_instance_count_files(markdown_dir, datasets.get("company_settings", []))
-    write_folder_structure(markdown_dir / "folder_structure.md", company, datasets)
+            if "datasources" not in args.excluded_sections:
+                datasource_rows: list[dict[str, Any]] = []
+                for device in rows:
+                    device_id = device.get("id")
+                    if device_id is None:
+                        continue
+                    datasource_rows.extend(
+                        {
+                            "deviceId": device_id,
+                            **datasource,
+                        }
+                        for datasource in client.collection(
+                            f"datasources_{device_id}",
+                            f"/device/devices/{device_id}/devicedatasources",
+                        )
+                    )
+                counts["datasources"] = write_csv(csv_dir / "datasources.csv", datasource_rows)
+                datasets["datasources"] = datasource_rows
+                if not args.no_raw_json:
+                    write_json(json_dir / "datasources.json", datasource_rows)
+
+    if "group_alert_settings" not in args.excluded_sections:
+        print("Collecting group_alert_settings...")
+        group_alert_rows = collect_group_alert_settings(
+            client, datasets.get("device_groups", [])
+        )
+        datasets["group_alert_settings"] = group_alert_rows
+        counts["group_alert_settings"] = write_csv(
+            csv_dir / "group_alert_settings.csv", group_alert_rows
+        )
+        if not args.no_raw_json:
+            write_json(json_dir / "group_alert_settings.json", group_alert_rows)
+
+    if "number_of_instances_per_ds" not in args.excluded_sections:
+        write_instance_count_files(markdown_dir, datasets.get("company_settings", []))
+    else:
+        for generated_file in (markdown_dir / "numberOfInstancesPerDS").glob("*.md"):
+            generated_file.unlink(missing_ok=True)
+    if "folder_structure" not in args.excluded_sections:
+        write_folder_structure(markdown_dir / "folder_structure.md", company, datasets)
+    else:
+        (markdown_dir / "folder_structure.md").unlink(missing_ok=True)
+    if "alert_routing_flow" not in args.excluded_sections:
+        write_alert_routing_flow(
+            markdown_dir / "alert_routing_flow.md", company, datasets
+        )
+    else:
+        (markdown_dir / "alert_routing_flow.md").unlink(missing_ok=True)
     write_csv(csv_dir / "collection_failures.csv", client.failures)
     write_csv(csv_dir / "collection_skipped.csv", client.skipped)
     write_markdown(
@@ -1038,10 +1367,14 @@ def main() -> int:
         datasets,
         creator,
         root,
+        company_image_name,
     )
     print(f"\nCreated as-built export in: {root}")
     print(f"Markdown_report: {safe_name(company)}_As_Built.md")
-    print("Folder_Structure: markdown/folder_structure.md")
+    if (markdown_dir / "folder_structure.md").is_file():
+        print("Folder_Structure: markdown/folder_structure.md")
+    if (markdown_dir / "alert_routing_flow.md").is_file():
+        print("Alert_Routing_Flow: markdown/alert_routing_flow.md")
     print(
         f"Datasets: {len(counts)}; endpoint failures: {len(client.failures)}; "
         f"unavailable features: {len(client.skipped)}"
@@ -1072,7 +1405,10 @@ def main() -> int:
     )
     print("Suggested files to review:")
     print(f"- {safe_name(company)}_As_Built.md — main report and Markdown preview")
-    print("- markdown/folder_structure.md — LogicMonitor group hierarchy")
+    if (markdown_dir / "alert_routing_flow.md").is_file():
+        print("- markdown/alert_routing_flow.md — group overrides and alert routing")
+    if (markdown_dir / "folder_structure.md").is_file():
+        print("- markdown/folder_structure.md — LogicMonitor group hierarchy")
     print("- csv/collection_failures.csv — failed API collections")
     print("- csv/collection_skipped.csv — unavailable portal features")
     print("- csv/devices.csv — resource inventory")
