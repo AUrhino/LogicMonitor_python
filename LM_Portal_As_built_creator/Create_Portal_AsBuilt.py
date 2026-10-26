@@ -27,14 +27,18 @@ from typing import Any, Iterable
 from urllib.parse import urlencode
 
 import requests
+import markdown as markdown_renderer
 from dotenv import load_dotenv
 
 
 DEFAULT_TIMEOUT = 60
 PAGE_SIZE = 1000
 API_VERSION = "3"
-__version__ = "1.07"
+RATE_LIMIT_SLEEP_SECONDS = 2
+MAX_RATE_LIMIT_RETRIES = 5
+__version__ = "1.13"
 SECRET_WORDS = re.compile(r"(pass(word)?|secret|token|community|private.?key|api.?key|access.?key|bearer|auth)", re.I)
+CSV_FIELD_ORDER: dict[str, tuple[str, ...]] = {}
 
 
 def cli() -> argparse.Namespace:
@@ -83,6 +87,11 @@ def cli() -> argparse.Namespace:
         help="Logo image placed at the top left of the report; defaults to company.png",
     )
     parser.add_argument(
+        "--csv-order-file",
+        default="csv_column_order.txt",
+        help="CSV column-order definitions; defaults to csv_column_order.txt",
+    )
+    parser.add_argument(
         "--no-raw-json", "--no-json", action="store_true",
         help="Do not write raw JSON response files",
     )
@@ -121,6 +130,7 @@ def cli() -> argparse.Namespace:
     for section_name in (
         "services", "datasources", "group_alert_settings",
         "alert_routing_flow", "folder_structure", "number_of_instances_per_ds",
+        "cost_recommendation_items", "cloud_endpoints", "portal_logos",
     ):
         parser.add_argument(
             f"--no-{section_name.replace('_', '-')}",
@@ -157,6 +167,8 @@ def cli() -> argparse.Namespace:
                 "collector_upgrade_history",
             }
         )
+    if "cost_recommendations" in excluded:
+        excluded.add("cost_recommendation_items")
     args.excluded_sections = excluded
     return args
 
@@ -237,17 +249,38 @@ class LogicMonitor:
         if self.debug:
             print(f"[DEBUG] GET {url}")
             print(f"[DEBUG] Signed resource: {signed_path}")
-        try:
-            response = self.session.get(
-                self.base + path,
-                params=params,
-                headers=self.headers("GET", signed_path),
-                timeout=self.timeout,
-            )
-        except requests.RequestException as exc:
+        response: requests.Response | None = None
+        for retry in range(MAX_RATE_LIMIT_RETRIES + 1):
+            try:
+                response = self.session.get(
+                    self.base + path,
+                    params=params,
+                    headers=self.headers("GET", signed_path),
+                    timeout=self.timeout,
+                )
+            except requests.RequestException as exc:
+                if self.debug:
+                    print(f"[DEBUG] Request failed: {exc}")
+                raise
+            if response.status_code != 429:
+                break
+            if retry >= MAX_RATE_LIMIT_RETRIES:
+                if self.debug:
+                    print(
+                        f"[DEBUG] HTTP 429 retry limit reached after "
+                        f"{MAX_RATE_LIMIT_RETRIES} retries"
+                    )
+                break
             if self.debug:
-                print(f"[DEBUG] Request failed: {exc}")
-            raise
+                print(
+                    f"[DEBUG] HTTP 429 rate limit detected; sleeping "
+                    f"{RATE_LIMIT_SLEEP_SECONDS} seconds before retry "
+                    f"{retry + 1}/{MAX_RATE_LIMIT_RETRIES}"
+                )
+            response.close()
+            time.sleep(RATE_LIMIT_SLEEP_SECONDS)
+        if response is None:
+            raise requests.RequestException(f"No response received for {url}")
         if self.debug:
             preview = re.sub(r"(?i)(access[_-]?key|token|password|secret)=([^&\s]+)", r"\1=[REDACTED]", response.text[:500])
             print(f"[DEBUG] Response: HTTP {response.status_code}, {len(response.content)} bytes")
@@ -256,6 +289,57 @@ class LogicMonitor:
         response.raise_for_status()
         payload = response.json()
         return payload if isinstance(payload, dict) else {"data": payload}
+
+    def download_image(self, name: str, path: str, destination: Path) -> dict[str, Any] | None:
+        """Download an authenticated image endpoint with normal rate-limit handling."""
+        url = self.base + path
+        if self.debug:
+            print(f"[DEBUG] GET {url}")
+            print(f"[DEBUG] Signed resource: {path}")
+        response: requests.Response | None = None
+        try:
+            for retry in range(MAX_RATE_LIMIT_RETRIES + 1):
+                response = self.session.get(
+                    url,
+                    headers=self.headers("GET", path),
+                    timeout=self.timeout,
+                )
+                if response.status_code != 429 or retry >= MAX_RATE_LIMIT_RETRIES:
+                    break
+                if self.debug:
+                    print(
+                        f"[DEBUG] HTTP 429 rate limit detected; sleeping "
+                        f"{RATE_LIMIT_SLEEP_SECONDS} seconds before retry "
+                        f"{retry + 1}/{MAX_RATE_LIMIT_RETRIES}"
+                    )
+                response.close()
+                time.sleep(RATE_LIMIT_SLEEP_SECONDS)
+            if response is None:
+                raise requests.RequestException(f"No response received for {url}")
+            if self.debug:
+                print(
+                    f"[DEBUG] Response: HTTP {response.status_code}, "
+                    f"{len(response.content)} bytes, {response.headers.get('content-type', '')}"
+                )
+            response.raise_for_status()
+            content_type = response.headers.get("content-type", "").split(";", 1)[0].lower()
+            if not content_type.startswith("image/"):
+                raise ValueError(f"Expected an image response, received {content_type or 'unknown content type'}")
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_bytes(response.content)
+            return {
+                "name": name,
+                "endpoint": path,
+                "file": destination.as_posix(),
+                "contentType": content_type,
+                "bytes": len(response.content),
+            }
+        except (requests.RequestException, ValueError, OSError) as exc:
+            message = str(exc)
+            self.failures.append({"collection": name, "path": path, "error": message})
+            if self.debug:
+                print(f"WARNING: {name}: {message}", file=sys.stderr)
+            return None
 
     def collection(
         self,
@@ -382,9 +466,56 @@ COLLECTIONS: list[tuple[str, str, bool]] = [
 ]
 
 
+CLOUD_ENDPOINTS: tuple[tuple[str, str, str, str | None], ...] = (
+    ("GET", "/aws/accountId", "Retrieve the LogicMonitor AWS account ID", "aws_account_id"),
+    ("GET", "/aws/externalId", "Retrieve the AWS external ID", "aws_external_id"),
+    ("POST", "/aws/functions/testAccount", "Test AWS account connectivity and configuration", None),
+    ("POST", "/aws/functions/verifyBillingPermissions", "Verify AWS billing permissions", None),
+    ("POST", "/azure/functions/testAccount", "Test Azure account connectivity", None),
+    ("POST", "/azure/functions/discoverSubscriptions", "Discover Azure subscriptions", None),
+    ("POST", "/azure/functions/verifyStorageAccountsPermissions", "Verify Azure Storage Account permissions", None),
+    ("POST", "/gcp/functions/testAccount", "Test GCP account connectivity", None),
+    ("POST", "/saas/functions/testAccount", "Test SaaS account connectivity", None),
+    ("GET", "/cost-optimization/recommendations/categories", "Retrieve cost optimisation recommendation categories", "cost_recommendation_categories"),
+    ("GET", "/cost-optimization/recommendations", "List cloud cost optimisation recommendations", "cost_recommendations"),
+    ("GET", "/cost-optimization/recommendations/{id}", "Retrieve each returned recommendation", "cost_recommendation_items"),
+    ("GET", "/usage/contractInfo", "Retrieve account contract information", "contract_info"),
+    ("GET", "/usage/focusCostUsage", "Export FOCUS cost and usage data", "focus_cost_usage"),
+    ("GET", "/device/groups", "List resource groups, including cloud account groups", "device_groups"),
+    ("GET", "/device/groups/{id}", "Retrieve an individual cloud account group", None),
+    ("PATCH", "/device/groups/{id}", "Update group configuration", None),
+    ("GET", "/device/groups/{id}/devices", "List monitored resources within a group", None),
+    ("GET", "/device/devices", "List monitored resources, including cloud resources", "devices"),
+    ("GET", "/device/devices/{id}", "Retrieve an individual resource", None),
+)
+
+
 
 def write_json(path: Path, value: Any) -> None:
     path.write_text(json.dumps(redact(value), indent=2, ensure_ascii=False, default=str) + "\n", encoding="utf-8")
+
+
+def load_csv_field_order(path: Path) -> dict[str, tuple[str, ...]]:
+    """Parse filename headings followed by comma- or tab-separated field names."""
+    if not path.is_file():
+        return {}
+    result: dict[str, list[str]] = {}
+    current: str | None = None
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        if line.lower().endswith(".csv") and " " not in line and "\t" not in line:
+            current = Path(line).stem
+            result.setdefault(current, [])
+            continue
+        if current is None or line.lower().startswith("change the following"):
+            continue
+        fields = [field.strip() for field in re.split(r"[\t,]+", line) if field.strip()]
+        for field in fields:
+            if field not in result[current]:
+                result[current].append(field)
+    return {name: tuple(fields) for name, fields in result.items()}
 
 
 def clean_excluded_outputs(csv_dir: Path, json_dir: Path) -> None:
@@ -408,7 +539,9 @@ def clean_excluded_outputs(csv_dir: Path, json_dir: Path) -> None:
 
 def write_csv(path: Path, rows: Iterable[dict[str, Any]]) -> int:
     flattened = [flatten(row) for row in rows]
-    keys = sorted({key for row in flattened for key in row})
+    available = {key for row in flattened for key in row}
+    preferred = list(CSV_FIELD_ORDER.get(path.stem, ()))
+    keys = preferred + sorted(available - set(preferred))
     with path.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=keys or ["value"])
         writer.writeheader()
@@ -417,9 +550,102 @@ def write_csv(path: Path, rows: Iterable[dict[str, Any]]) -> int:
     return len(flattened)
 
 
+def capture_portal_logos(client: LogicMonitor, root: Path) -> list[dict[str, Any]]:
+    """Capture the configured portal heading and login logos as image evidence."""
+    image_dir = root / "images"
+    definitions = (
+        ("portal_heading_logo", "/setting/logos/company", "portal_heading_logo"),
+        ("portal_login_logo", "/setting/logos/login", "portal_login_logo"),
+    )
+    rows: list[dict[str, Any]] = []
+    extensions = {
+        "image/png": ".png", "image/jpeg": ".jpg", "image/gif": ".gif",
+        "image/webp": ".webp", "image/svg+xml": ".svg",
+    }
+    for name, endpoint, stem in definitions:
+        for stale_file in image_dir.glob(f"{stem}.*"):
+            stale_file.unlink(missing_ok=True)
+        temporary = image_dir / f"{stem}.download"
+        result = client.download_image(name, endpoint, temporary)
+        if result:
+            extension = extensions.get(str(result.get("contentType", "")), ".img")
+            destination = image_dir / f"{stem}{extension}"
+            temporary.replace(destination)
+            result["file"] = f"images/{destination.name}"
+            rows.append(result)
+        else:
+            temporary.unlink(missing_ok=True)
+    return rows
+
+
+def preferred_report_logo(
+    portal_logos: list[dict[str, Any]], fallback: str | None
+) -> str | None:
+    """Prefer the client's portal heading logo, retaining company.png as fallback."""
+    for logo in portal_logos:
+        if logo.get("name") == "portal_heading_logo" and logo.get("file"):
+            return str(logo["file"])
+    return fallback
+
+
 def markdown_cell(value: Any, limit: int = 500) -> str:
     text = scalar(redact(value)).replace("|", "\\|").replace("\n", "<br>")
     return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
+HTML_STYLE = """
+body { font-family: Arial, Helvetica, sans-serif; color: #17213a; line-height: 1.45;
+       max-width: 1400px; margin: 0 auto; padding: 32px; }
+h1, h2, h3, h4 { color: #07164f; page-break-after: avoid; }
+h1 { border-bottom: 3px solid #1f69ff; padding-bottom: 10px; }
+table { border-collapse: collapse; width: 100%; margin: 16px 0 24px; font-size: 0.9rem; }
+th, td { border: 1px solid #c8cfdd; padding: 7px 9px; text-align: left; vertical-align: top; }
+th { background: #eaf0ff; color: #07164f; }
+tr:nth-child(even) td { background: #f8faff; }
+code { background: #f1f3f7; padding: 0.12em 0.3em; border-radius: 3px; }
+pre { background: #f1f3f7; padding: 14px; overflow-x: auto; border-radius: 5px; }
+pre code { padding: 0; }
+img { max-width: 100%; height: auto; }
+blockquote { border-left: 4px solid #1f69ff; margin-left: 0; padding-left: 14px; color: #44506a; }
+a { color: #0758c7; }
+@media print { body { max-width: none; padding: 0; } table, pre { page-break-inside: avoid; } }
+""".strip()
+
+
+def write_html_from_markdown(markdown_path: Path) -> Path:
+    """Render one generated Markdown document to a standalone HTML companion."""
+    source = markdown_path.read_text(encoding="utf-8")
+    body = markdown_renderer.markdown(
+        source,
+        extensions=["tables", "fenced_code", "sane_lists"],
+        output_format="html5",
+    )
+    title_match = re.search(r"^#\s+(.+)$", source, flags=re.MULTILINE)
+    title = title_match.group(1).strip() if title_match else markdown_path.stem
+    title = (
+        title.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+        .replace('"', "&quot;")
+    )
+    document = (
+        "<!doctype html>\n<html lang=\"en\">\n<head>\n"
+        "<meta charset=\"utf-8\">\n"
+        "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n"
+        f"<title>{title}</title>\n<style>\n{HTML_STYLE}\n</style>\n"
+        f"</head>\n<body>\n{body}\n</body>\n</html>\n"
+    )
+    html_path = markdown_path.with_suffix(".html")
+    html_path.write_text(document, encoding="utf-8")
+    return html_path
+
+
+def write_html_companions(root: Path) -> list[Path]:
+    """Render every generated Markdown file below the export root to HTML."""
+    markdown_paths = sorted(root.rglob("*.md"))
+    expected_html = {path.with_suffix(".html") for path in markdown_paths}
+    for html_path in root.rglob("*.html"):
+        if html_path not in expected_html:
+            html_path.unlink(missing_ok=True)
+    return [write_html_from_markdown(path) for path in markdown_paths]
 
 
 def load_creator(path: Path) -> dict[str, Any]:
@@ -645,6 +871,117 @@ def dataset_table(
         lines.append("| " + " | ".join(values) + " |")
     lines.append("")
     return lines
+
+
+def collect_cost_recommendation_items(
+    client: LogicMonitor, recommendations: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Collect the documented per-ID view for recommendations returned by the list API."""
+    items: list[dict[str, Any]] = []
+    for recommendation in recommendations:
+        recommendation_id = recommendation.get("id")
+        if recommendation_id in (None, ""):
+            continue
+        returned = client.collection(
+            f"cost_recommendation_{recommendation_id}",
+            f"/cost-optimization/recommendations/{recommendation_id}",
+            paginate=False,
+        )
+        items.extend(returned)
+    return items
+
+
+def cloud_group_rows(groups: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Select groups whose returned fields indicate a cloud account or cloud resources."""
+    cloud_terms = ("aws", "azure", "gcp", "google cloud", "oci", "saas", "kubernetes")
+    selected: list[dict[str, Any]] = []
+    for row in groups:
+        searchable = " ".join(
+            scalar(value).lower()
+            for key, value in row.items()
+            if key in {"name", "fullPath", "description", "groupType", "type"}
+            or any(term in key.lower() for term in cloud_terms)
+        )
+        cloud_value_present = any(
+            any(term in key.lower() for term in cloud_terms)
+            and value not in (None, "", 0, "0", False, "false", "False", [], {})
+            for key, value in row.items()
+        )
+        if any(term in searchable for term in cloud_terms) or cloud_value_present:
+            selected.append(row)
+    return selected
+
+
+def write_cloud_endpoints(
+    path: Path,
+    company: str,
+    datasets: dict[str, list[dict[str, Any]]],
+    excluded: set[str],
+) -> None:
+    """Write cloud API coverage and a compact cloud-account inventory."""
+    lines = [
+        f"# {company} — Cloud endpoints",
+        "",
+        "All executed requests use LogicMonitor REST API v3 through the `X-Version: 3` header.",
+        "The exporter remains read-only: POST validation/discovery operations and PATCH updates are documented but are not executed.",
+        "",
+        "## Endpoint coverage",
+        "",
+        "| Method | Endpoint | Purpose | Export status | Evidence |",
+        "|---|---|---|---|---|",
+    ]
+    for method, endpoint, purpose, dataset_name in CLOUD_ENDPOINTS:
+        evidence = "—"
+        if dataset_name and dataset_name in excluded:
+            status = "Skipped by command-line option"
+        elif dataset_name and dataset_name in datasets:
+            status = f"Collected ({len(datasets[dataset_name])} row(s))"
+            evidence = f"`csv/{dataset_name}.csv`"
+            if endpoint == "/cost-optimization/recommendations/{id}":
+                evidence = "`csv/cost_recommendation_items.csv`"
+        elif method in {"POST", "PATCH"}:
+            status = "Documented only — not executed by this read-only exporter"
+        elif endpoint in {
+            "/device/groups/{id}", "/device/groups/{id}/devices", "/device/devices/{id}"
+        }:
+            status = "Represented by the list inventories; per-object expansion is not collected"
+        else:
+            status = "Not collected"
+        lines.append(
+            f"| {method} | `{endpoint}` | {markdown_cell(purpose)} | "
+            f"{markdown_cell(status)} | {evidence} |"
+        )
+
+    cloud_groups = cloud_group_rows(datasets.get("device_groups", []))
+    lines += ["", "## Cloud account groups", ""]
+    if cloud_groups:
+        fields = (
+            "id", "name", "fullPath", "groupType", "numOfAWSDevices",
+            "numOfAzureDevices", "numOfGcpDevices", "numOfOciDevices",
+            "numOfKubernetesDevices", "awsTestResult", "azureTestResult",
+            "gcpTestResult", "ociTestResult", "saasTestResult",
+        )
+        lines += [
+            "| " + " | ".join(fields) + " |",
+            "| " + " | ".join("---" for _ in fields) + " |",
+        ]
+        for row in cloud_groups:
+            lines.append(
+                "| " + " | ".join(markdown_cell(row.get(field, ""), 200) for field in fields) + " |"
+            )
+    else:
+        lines.append("No cloud account groups were identified in the returned device-group inventory.")
+
+    lines += [
+        "",
+        "## Review notes",
+        "",
+        "- POST account tests require provider-specific request bodies and may perform live validation; run them separately only with explicit approval.",
+        "- PATCH endpoints are intentionally never called by this exporter.",
+        "- Empty or unavailable cost/usage datasets can reflect licensing, portal configuration, API permissions, or an account with no applicable cloud data.",
+        "",
+    ]
+    path.write_text("\n".join(lines), encoding="utf-8")
 
 
 def portal_monitoring_section(
@@ -932,6 +1269,7 @@ def write_summary_markdown(
     failures: list[dict[str, str]],
     creator: dict[str, Any],
     company_image: str | None,
+    portal_logos: list[dict[str, Any]],
 ) -> None:
     display = company.replace("_", " ").replace("-", " ").title()
     lines = []
@@ -968,6 +1306,23 @@ def write_summary_markdown(
             ]
     else:
         lines.append("No company settings were returned.")
+    lines += ["", "## Portal branding", ""]
+    if portal_logos:
+        for logo in portal_logos:
+            label = str(logo.get("name", "portal logo")).replace("_", " ").title()
+            lines += [
+                f"**{label}**  ",
+                f'<img src="{logo.get("file", "")}" alt="{label}" style="max-width:530px;max-height:120px">',
+                "",
+            ]
+    else:
+        lines.append("No portal logo images were returned.")
+    lines += [
+        "",
+        "## Normalized Properties",
+        "",
+        "Normalized Properties are not available through the supported external REST API v3. The internal v4 query rejects external API-token calls, so this exporter does not claim them as collected evidence.",
+    ]
     if failures:
         lines += ["", "## Collection failure", "", "| Path | Error |", "|---|---|"]
         for failure in failures:
@@ -1060,6 +1415,27 @@ def write_markdown(
                 lines.append(f"| `{key}` | {markdown_cell(stats[key])} |")
         else:
             lines.append("Alert statistics were not returned; see collection failures or skipped features.")
+    if "portal_logos" in datasets:
+        lines += ["", "### Portal branding", ""]
+        logo_rows = datasets.get("portal_logos", [])
+        if logo_rows:
+            for logo in logo_rows:
+                label = str(logo.get("name", "portal logo")).replace("_", " ").title()
+                relative_file = str(logo.get("file", ""))
+                lines += [
+                    f"**{label}**  ",
+                    f"Endpoint: `{logo.get('endpoint', '')}`  ",
+                    f'<img src="{relative_file}" alt="{label}" style="max-width:530px;max-height:120px">',
+                    "",
+                ]
+        else:
+            lines.append("No portal logo images were returned.")
+    lines += [
+        "",
+        "### Normalized Properties",
+        "",
+        "Normalized Properties are not available through the supported external REST API v3. LogicMonitor's current query uses the internal v4 `POST /normalizedProperties/filter` operation; external API-token calls to v4 are rejected. This exporter therefore does not claim Normalized Properties as collected evidence.",
+    ]
     lines += ["", "## Exported evidence", "", "| Dataset | Rows | Evidence |", "|---|---:|---|"]
     for name, count in counts.items():
         evidence_parts = []
@@ -1093,7 +1469,7 @@ def write_markdown(
             f"### {title}", "", f"**Rows:** {len(rows)}  ",
             f"**Evidence:** {' and '.join(dataset_evidence)}", "",
         ]
-        if name in {"company_settings", "alert_statistics"}:
+        if name in {"company_settings", "alert_statistics", "portal_logos"}:
             lines += ["A complete formatted table appears above.", ""]
             continue
         if name == "device_groups":
@@ -1116,6 +1492,14 @@ def write_markdown(
             "## Alert routing flow",
             "",
             "Group-level DataSource alert overrides, alert rules, escalation chains, destinations, action rules, and action chains are mapped in `markdown/alert_routing_flow.md`.",
+            "",
+        ]
+    if (output / "markdown" / "cloud_endpoints.md").is_file():
+        lines += [
+            "",
+            "## Cloud endpoints",
+            "",
+            "Cloud discovery, cost optimisation, usage, and generic cloud-resource endpoint coverage is documented in `markdown/cloud_endpoints.md`.",
             "",
         ]
     if any(name in datasets for name in ("collectors", "collector_groups", "collector_versions")):
@@ -1186,12 +1570,17 @@ def write_markdown(
         "```text",
         ".",
         "├── csv",
+        "├── images",
+        "│   ├── portal_heading_logo.<image extension>",
+        "│   └── portal_login_logo.<image extension>",
         "├── json",
         "├── markdown",
-        "│   ├── alert_routing_flow.md",
-        "│   ├── folder_structure.md",
+        "│   ├── alert_routing_flow.md / alert_routing_flow.html",
+        "│   ├── cloud_endpoints.md / cloud_endpoints.html",
+        "│   ├── folder_structure.md / folder_structure.html",
         "│   └── numberOfInstancesPerDS",
-        f"└── {path.name}",
+        f"├── {path.name}",
+        f"└── {path.with_suffix('.html').name}",
         "```",
         "",
         "End of document.",
@@ -1219,11 +1608,19 @@ def main() -> int:
         print(str(exc), file=sys.stderr)
         return 2
 
+    csv_order_path = Path(args.csv_order_file).expanduser()
+    if not csv_order_path.is_file() and args.csv_order_file == "csv_column_order.txt":
+        csv_order_path = Path(__file__).with_name("csv_column_order.txt")
+    CSV_FIELD_ORDER.clear()
+    CSV_FIELD_ORDER.update(load_csv_field_order(csv_order_path))
+
     if args.debug:
         print("[DEBUG] ============ LogicMonitor export configuration ============")
         print(f"[DEBUG] Portal: https://{company}.logicmonitor.com")
         print(f"[DEBUG] Credentials file: {Path(args.creds_file).expanduser().resolve()}")
         print(f"[DEBUG] API version: {API_VERSION}")
+        print(f"[DEBUG] CSV order file: {csv_order_path.resolve() if csv_order_path.is_file() else 'not found'}")
+        print(f"[DEBUG] CSV order schemas: {len(CSV_FIELD_ORDER)}")
         print("[DEBUG] Access ID/key: loaded (values not displayed)")
         print("[DEBUG] ===========================================================")
 
@@ -1253,6 +1650,11 @@ def main() -> int:
         rows = client.collection(
             "company_settings", "/setting/companySetting", paginate=False
         )
+        portal_logos = []
+        if "portal_logos" not in args.excluded_sections:
+            print("Collecting portal_logos...")
+            portal_logos = capture_portal_logos(client, root)
+        report_logo = preferred_report_logo(portal_logos, company_image_name)
         write_instance_count_files(markdown_dir, rows)
         markdown_path = root / f"{safe_name(company)}_As_Built.md"
         write_summary_markdown(
@@ -1262,9 +1664,14 @@ def main() -> int:
             rows,
             client.failures,
             creator,
-            company_image_name,
+            report_logo,
+            portal_logos,
         )
+        html_files = write_html_companions(root)
         print(f"\nCreated company-settings summary: {markdown_path}")
+        print(f"HTML_report: {markdown_path.with_suffix('.html').name}")
+        if args.debug:
+            print(f"[DEBUG] HTML files created: {len(html_files)}")
         return 0 if rows else 1
 
     csv_dir, json_dir = root / "csv", root / "json"
@@ -1328,6 +1735,18 @@ def main() -> int:
                 if not args.no_raw_json:
                     write_json(json_dir / "datasources.json", datasource_rows)
 
+    if "portal_logos" not in args.excluded_sections:
+        print("Collecting portal_logos...")
+        portal_logo_rows = capture_portal_logos(client, root)
+        datasets["portal_logos"] = portal_logo_rows
+        counts["portal_logos"] = write_csv(
+            csv_dir / "portal_logos.csv", portal_logo_rows
+        )
+    else:
+        (csv_dir / "portal_logos.csv").unlink(missing_ok=True)
+        for logo_file in (root / "images").glob("portal_*_logo.*"):
+            logo_file.unlink(missing_ok=True)
+
     if "group_alert_settings" not in args.excluded_sections:
         print("Collecting group_alert_settings...")
         group_alert_rows = collect_group_alert_settings(
@@ -1339,6 +1758,18 @@ def main() -> int:
         )
         if not args.no_raw_json:
             write_json(json_dir / "group_alert_settings.json", group_alert_rows)
+
+    if "cost_recommendation_items" not in args.excluded_sections:
+        print("Collecting cost_recommendation_items...")
+        recommendation_items = collect_cost_recommendation_items(
+            client, datasets.get("cost_recommendations", [])
+        )
+        datasets["cost_recommendation_items"] = recommendation_items
+        counts["cost_recommendation_items"] = write_csv(
+            csv_dir / "cost_recommendation_items.csv", recommendation_items
+        )
+        if not args.no_raw_json:
+            write_json(json_dir / "cost_recommendation_items.json", recommendation_items)
 
     if "number_of_instances_per_ds" not in args.excluded_sections:
         write_instance_count_files(markdown_dir, datasets.get("company_settings", []))
@@ -1355,6 +1786,15 @@ def main() -> int:
         )
     else:
         (markdown_dir / "alert_routing_flow.md").unlink(missing_ok=True)
+    if "cloud_endpoints" not in args.excluded_sections:
+        write_cloud_endpoints(
+            markdown_dir / "cloud_endpoints.md",
+            company,
+            datasets,
+            args.excluded_sections,
+        )
+    else:
+        (markdown_dir / "cloud_endpoints.md").unlink(missing_ok=True)
     write_csv(csv_dir / "collection_failures.csv", client.failures)
     write_csv(csv_dir / "collection_skipped.csv", client.skipped)
     write_markdown(
@@ -1367,14 +1807,20 @@ def main() -> int:
         datasets,
         creator,
         root,
-        company_image_name,
+        preferred_report_logo(datasets.get("portal_logos", []), company_image_name),
     )
+    html_files = write_html_companions(root)
     print(f"\nCreated as-built export in: {root}")
     print(f"Markdown_report: {safe_name(company)}_As_Built.md")
+    print(f"HTML_report: {safe_name(company)}_As_Built.html")
     if (markdown_dir / "folder_structure.md").is_file():
         print("Folder_Structure: markdown/folder_structure.md")
     if (markdown_dir / "alert_routing_flow.md").is_file():
         print("Alert_Routing_Flow: markdown/alert_routing_flow.md")
+    if (markdown_dir / "cloud_endpoints.md").is_file():
+        print("Cloud_Endpoints: markdown/cloud_endpoints.md")
+    if args.debug:
+        print(f"[DEBUG] HTML files created: {len(html_files)}")
     print(
         f"Datasets: {len(counts)}; endpoint failures: {len(client.failures)}; "
         f"unavailable features: {len(client.skipped)}"
@@ -1409,6 +1855,8 @@ def main() -> int:
         print("- markdown/alert_routing_flow.md — group overrides and alert routing")
     if (markdown_dir / "folder_structure.md").is_file():
         print("- markdown/folder_structure.md — LogicMonitor group hierarchy")
+    if (markdown_dir / "cloud_endpoints.md").is_file():
+        print("- markdown/cloud_endpoints.md — cloud API coverage and account inventory")
     print("- csv/collection_failures.csv — failed API collections")
     print("- csv/collection_skipped.csv — unavailable portal features")
     print("- csv/devices.csv — resource inventory")
